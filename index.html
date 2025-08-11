@@ -156,6 +156,7 @@
             border: 5px solid var(--white);
             animation: float 3s ease-in-out infinite;
             background: var(--gradient-1);
+            object-fit: cover;
         }
 
         @keyframes float {
@@ -462,6 +463,90 @@
             color: var(--secondary-color);
         }
 
+        /* Certifications Grid */
+        .cert-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin-top: 3rem;
+        }
+
+        .cert-card {
+            background: var(--white);
+            padding: 2rem;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0, 0, 0, 0.05);
+            transition: all 0.3s ease;
+            text-align: center;
+        }
+
+        .cert-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+        }
+
+        .cert-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        .cert-card h4 {
+            color: var(--primary-color);
+            margin-bottom: 0.5rem;
+        }
+
+        .cert-card .issuer {
+            color: #666;
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+        }
+
+        .cert-link {
+            display: inline-block;
+            padding: 8px 20px;
+            background: var(--gradient-1);
+            color: var(--white);
+            text-decoration: none;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+        }
+
+        .cert-link:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        /* Portfolio Section */
+        .portfolio-links {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            margin-top: 2rem;
+            flex-wrap: wrap;
+        }
+
+        .portfolio-link {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 12px 24px;
+            background: var(--white);
+            color: var(--primary-color);
+            text-decoration: none;
+            border-radius: 30px;
+            box-shadow: 0 5px 20px rgba(0, 0, 0, 0.05);
+            transition: all 0.3s ease;
+            font-weight: 500;
+        }
+
+        .portfolio-link:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+            background: var(--gradient-1);
+            color: var(--white);
+        }
+
         /* Footer */
         footer {
             background: var(--primary-color);
@@ -550,7 +635,7 @@
     <!-- Hero Section -->
     <section id="home" class="hero">
         <div class="hero-content">
-            <div class="profile-img"></div>
+            <img src="profile.jpeg" alt="Juan Pablo Pérez Franco" class="profile-img">
             <h1>Juan Pablo Pérez Franco</h1>
             <p class="tagline">Software Developer & Data Scientist</p>
             <p class="hero-description">
@@ -561,6 +646,17 @@
             <div class="cta-buttons">
                 <a href="#contact" class="btn btn-primary">Get In Touch</a>
                 <a href="#experience" class="btn btn-secondary">View My Work</a>
+            </div>
+            <div class="portfolio-links">
+                <a href="https://www.datacamp.com/portfolio/juanppf" target="_blank" class="portfolio-link">
+                    <span>📊</span> DataCamp Portfolio
+                </a>
+                <a href="https://www.credly.com/users/juan-pablo-perez-franco" target="_blank" class="portfolio-link">
+                    <span>🏆</span> Credly Badges
+                </a>
+                <a href="https://github.com/Pablinki" target="_blank" class="portfolio-link">
+                    <span>💻</span> GitHub Projects
+                </a>
             </div>
         </div>
     </section>
@@ -817,11 +913,33 @@
                     <p>2009 - 2013</p>
                     <p>Specialized in network systems, telecommunications, and distributed computing.</p>
                 </div>
-                <div class="skill-category scroll-animate">
-                    <h3>📜 Digital Certifications</h3>
-                    <p><strong>2016 - 2024</strong></p>
-                    <p>Multiple professional certifications in software development, data analysis, and emerging technologies.</p>
-                    <a href="#" class="btn btn-secondary" style="margin-top: 1rem;">View Portfolio</a>
+            </div>
+            
+            <h3 style="text-align: center; margin-top: 4rem; margin-bottom: 2rem; color: var(--primary-color);">Professional Certifications</h3>
+            <div class="cert-grid">
+                <div class="cert-card scroll-animate">
+                    <div class="cert-icon">🛡️</div>
+                    <h4>CyberOps Associate</h4>
+                    <p class="issuer">Cisco</p>
+                    <a href="https://www.credly.com/badges/6d8865de-cf88-45c4-ade7-7ca825ec9704" target="_blank" class="cert-link">View Certificate</a>
+                </div>
+                <div class="cert-card scroll-animate">
+                    <div class="cert-icon">📊</div>
+                    <h4>Data Analysis</h4>
+                    <p class="issuer">IBM</p>
+                    <a href="https://www.credly.com/badges/697534fb-7391-4ddd-98df-324ab1571d7f/public_url" target="_blank" class="cert-link">View Certificate</a>
+                </div>
+                <div class="cert-card scroll-animate">
+                    <div class="cert-icon">🐳</div>
+                    <h4>Docker Essentials</h4>
+                    <p class="issuer">IBM</p>
+                    <a href="https://www.credly.com/badges/af0725b6-8185-47fa-88c1-938a9144807b/public_url" target="_blank" class="cert-link">View Certificate</a>
+                </div>
+                <div class="cert-card scroll-animate">
+                    <div class="cert-icon">📚</div>
+                    <h4>DataCamp Courses</h4>
+                    <p class="issuer">DataCamp</p>
+                    <a href="https://www.datacamp.com/portfolio/juanppf" target="_blank" class="cert-link">View Portfolio</a>
                 </div>
             </div>
         </div>
@@ -845,9 +963,13 @@
                     <div class="contact-item scroll-animate">
                         <div class="contact-icon">✉️</div>
                         <h4>Email</h4>
-                        <p>juanppf@gmail.com</p>
+                        <p>juan.franco@senado.gob.mx</p>
                     </div>
-                    
+                    <div class="contact-item scroll-animate">
+                        <div class="contact-icon">📍</div>
+                        <h4>Location</h4>
+                        <p><br>Mexico City</p>
+                    </div>
                 </div>
             </div>
         </div>
@@ -858,7 +980,7 @@
         <div class="container">
             <div class="social-links">
                 <a href="https://www.linkedin.com/in/juanpabloperezfranco" target="_blank">💼</a>
-                <a href="mailto:juanppf@gmail.com">✉️</a>
+                <a href="mailto:juan.franco@senado.gob.mx">✉️</a>
             </div>
             <p>&copy; 2025 Juan Pablo Pérez Franco. All rights reserved.</p>
         </div>

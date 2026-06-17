@@ -25,7 +25,7 @@ This is my professional resume and portfolio website showcasing my experience as
 
 ## 📱 Contact Information
 
-- **Email**: juan.franco@senado.gob.mx
+- **Email**: juanppf@gmail.com
 - **Phone**: +52 55 4914-3777
 - **LinkedIn**: [juanpabloperezfranco](https://www.linkedin.com/in/juanpabloperezfranco)
 - **Location**: Mexico City, Mexico

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-agent"
+version = "1.0.0"
+description = "Trading agent con Deep Q-Learning (Double DQN), datos de Yahoo Finance o Bloomberg, gestión de riesgo y paper trading"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "numpy==1.26.4",
+    "pandas==2.2.3",
+    "pyarrow==19.0.1",
+    "yfinance==0.2.54",
+    "PyYAML==6.0.2",
+    "torch==2.6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"

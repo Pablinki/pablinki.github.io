@@ -77,6 +77,10 @@ modo *paper trading* con una capa de **gestión de riesgo determinista**.
 
 ## Instalación
 
+> 🪟 **Windows 11**: sigue la guía paso a paso en
+> [INSTALACION_WINDOWS.md](INSTALACION_WINDOWS.md) (Python, venv,
+> PowerShell y solución de problemas).
+
 Requiere **Python 3.10–3.12** (probado con 3.11). Las versiones de
 `requirements.txt` están fijadas y verificadas compatibles entre sí:
 

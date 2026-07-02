@@ -1,0 +1,42 @@
+# Configuración del trading agent DQN.
+# Todos los parámetros del sistema viven aquí; los que se omiten toman el
+# valor por defecto documentado en src/trading_agent/config.py.
+
+data:
+  provider: yahoo          # "yahoo" (gratuito) o "bloomberg" (requiere blpapi + Terminal)
+  symbols: [AAPL]          # el primer símbolo es el que se entrena/opera
+  interval: 1d             # 1m / 5m / 15m / 30m / 1h / 1d
+  lookback_days: 1460      # ~4 años de histórico para entrenar
+  max_retries: 3           # reintentos ante fallos transitorios de red
+  retry_backoff_s: 1.0     # backoff exponencial: 1s, 2s, 4s...
+  cache_dir: .cache/market_data
+
+agent:
+  hidden_sizes: [128, 64]  # arquitectura del MLP de la red Q
+  lr: 0.001                # learning rate (Adam)
+  gamma: 0.99              # descuento de recompensas futuras
+  epsilon_start: 1.0       # exploración inicial (100% aleatorio)
+  epsilon_end: 0.05        # exploración mínima
+  epsilon_decay: 0.995     # decaimiento por episodio
+  batch_size: 64
+  buffer_capacity: 100000
+  min_buffer_size: 1000    # calentamiento antes de aprender
+  target_update_every: 500 # sincronización de la red objetivo
+  grad_clip_norm: 10.0
+  double_dqn: true
+  device: cpu              # "cuda" si hay GPU
+  seed: 42
+
+env:
+  window_size: 30          # velas de historia en el estado
+  initial_cash: 100000.0
+  commission_pct: 0.001    # 0.1% por operación
+  slippage_pct: 0.0005     # 0.05% de deslizamiento adverso
+  reward_scaling: 100.0
+
+risk:
+  max_position_pct: 0.25   # máx. 25% del equity por posición
+  max_drawdown_pct: 0.20   # kill-switch al perder 20% desde el pico
+  stop_loss_pct: 0.05      # cierre forzoso a -5% por posición
+  take_profit_pct: 0.10    # toma de ganancias a +10% (null para desactivar)
+  max_daily_loss_pct: 0.03 # sin aperturas nuevas tras perder 3% en el día

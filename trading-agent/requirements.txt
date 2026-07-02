@@ -1,0 +1,17 @@
+# Dependencias con versiones fijadas y verificadas compatibles entre sí
+# sobre Python 3.11 (probado con 3.11.15).
+#
+# numpy 1.26.x es la última serie 1.x: compatible a la vez con
+# pandas 2.2.x, torch 2.6 y pyarrow (caché parquet de yfinance).
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==19.0.1          # motor parquet del caché de datos
+yfinance==0.2.54         # proveedor Yahoo Finance
+PyYAML==6.0.2            # carga de config.yaml
+torch==2.6.0             # red Q del DQN (instalar variante CPU o CUDA)
+
+# --- Desarrollo / tests ---
+pytest==8.3.4
+
+# --- Opcional: proveedor Bloomberg (requiere Terminal/B-PIPE) ---
+# blpapi==3.24.11 --index-url=https://blpapi.bloomberg.com/repository/releases/python/simple/

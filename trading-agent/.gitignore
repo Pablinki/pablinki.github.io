@@ -1,0 +1,11 @@
+# Artefactos de ejecución (nunca al repo)
+.cache/
+checkpoints/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Secretos: SIEMPRE fuera del control de versiones
+.env
+*.key

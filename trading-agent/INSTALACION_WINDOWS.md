@@ -175,10 +175,68 @@ limpiamente con **Ctrl+C** (liquida la posición abierta antes de salir).
 
 > **Seguridad:** este modo es 100% simulado. El trading con dinero real
 > está deshabilitado por diseño salvo que definas explícitamente la
-> variable de entorno `TRADING_AGENT_LIVE=YES` **y** conectes un adaptador
-> de broker (no incluido).
+> variable de entorno `TRADING_AGENT_LIVE=YES` **y** apuntes el adaptador
+> de Alpaca (paso 9) al endpoint real.
 
-## 9. Uso diario (resumen)
+## 9. Conectar Alpaca (órdenes reales — empieza por su modo paper)
+
+El proyecto incluye un adaptador para **Alpaca Markets** que ejecuta
+órdenes de mercado reales. La escalera recomendada: paper local (paso 8)
+→ paper de Alpaca (esta sección) → dinero real, solo si lo anterior
+convence.
+
+**9.1. Crear la cuenta (gratis, solo correo):**
+
+1. Entra en https://app.alpaca.markets/signup y regístrate con tu correo.
+2. Confirma el enlace de verificación que te llega por email.
+3. Ya tienes acceso al dashboard con **paper trading ilimitado y
+   gratuito** (~100.000 USD virtuales). No necesitas verificación de
+   identidad ni depósito para esto.
+
+> La cuenta con dinero real es un trámite aparte dentro del mismo
+> dashboard (verificación de identidad/KYC). Solo la necesitas en el
+> último escalón.
+
+**9.2. Obtener las API keys:**
+
+1. En el dashboard, en la **esquina superior izquierda**, selecciona el
+   entorno **"Paper Trading"**. Importante: las claves de paper y las de
+   real son pares distintos; mezclarlas da error de autenticación.
+2. En la página principal, localiza **"Your API Keys"** (panel derecho;
+   según versiones del sitio puede estar bajo *Settings/Account*).
+3. Pulsa **View / Generate**: copia el **API Key ID** y el **Secret
+   Key** en ese momento (el secreto se muestra una sola vez; si lo
+   pierdes o se filtra, regenera el par — invalida el anterior).
+
+**9.3. Conectar el agente (PowerShell, con el venv activo):**
+
+```powershell
+$env:ALPACA_API_KEY = "tu-key-id"
+$env:ALPACA_SECRET_KEY = "tu-secret"
+# NO definas ALPACA_BASE_URL: el defecto ya es el paper de Alpaca.
+
+python scripts\run_live.py --broker alpaca --checkpoint checkpoints\dqn_best.pt
+```
+
+Verás cada operación reflejada en el dashboard de Alpaca (entorno paper)
+mientras el agente opera. Las claves van **solo** en variables de
+entorno, nunca en archivos del repositorio.
+
+**9.4. Dinero real (el último escalón, cuando el paper convenza):**
+
+```powershell
+$env:TRADING_AGENT_LIVE = "YES"                        # habilitación consciente
+$env:ALPACA_BASE_URL = "https://api.alpaca.markets"    # endpoint real
+# y usa las API keys del entorno LIVE (no las de paper)
+```
+
+Sin **ambas** variables, el adaptador rechaza arrancar en real
+(`SecurityError`). Empieza con capital pequeño y límites de riesgo
+estrictos en `config.yaml`. Si usas intervalos intradía, ten presente la
+regla *Pattern Day Trader* de EE. UU. (25.000 USD mínimos para más de 3
+day-trades en 5 días hábiles).
+
+## 10. Uso diario (resumen)
 
 Cada vez que abras una terminal nueva:
 
@@ -188,7 +246,7 @@ cd $HOME\pablinki.github.io\trading-agent
 python scripts\run_live.py --checkpoint checkpoints\dqn_best.pt
 ```
 
-## 10. Solución de problemas frecuentes
+## 11. Solución de problemas frecuentes
 
 | Síntoma | Causa y solución |
 |---|---|
@@ -198,8 +256,10 @@ python scripts\run_live.py --checkpoint checkpoints\dqn_best.pt
 | `DataProviderError ... yfinance devolvió vacío` | Sin internet, o firewall/proxy corporativo bloqueando `finance.yahoo.com`. Prueba desde otra red. |
 | Los tests fallan tras editar código | Ejecuta `pytest -v` para ver cuál y por qué; la suite es determinista. |
 | Antivirus ralentiza el entrenamiento | Añade la carpeta del proyecto a las exclusiones de Microsoft Defender (opcional). |
+| Alpaca responde `401/403` | Claves mal copiadas o de entorno equivocado: las keys de paper solo valen con la URL de paper (y las de live con la real). Regenera el par en el dashboard si hace falta. |
+| `SecurityError: Trading en vivo deshabilitado` | Intentaste apuntar al endpoint real sin `TRADING_AGENT_LIVE=YES`. Es intencional (paso 9.4). |
 
-## 11. Bloomberg (opcional)
+## 12. Bloomberg (opcional)
 
 Solo si tienes una **Terminal Bloomberg** instalada en esa laptop:
 

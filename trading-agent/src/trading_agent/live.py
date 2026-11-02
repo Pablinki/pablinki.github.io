@@ -29,7 +29,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import signal
-import time
+import threading
 from types import FrameType
 
 import numpy as np
@@ -37,12 +37,14 @@ import numpy as np
 from .agent.dqn import DQNAgent
 from .brokers import BrokerAdapter, PaperBroker, make_broker
 from .config import AppConfig
-from .data.provider import DataProvider, make_provider
+from .data.provider import DataProvider, completed_bars, make_provider
 from .env import Action
 from .exceptions import DataProviderError, ExecutionError, TradingAgentError
 from .features import FEATURE_COLUMNS, build_features
-from .portfolio import Portfolio
+from .journal import TradeJournal
+from .portfolio import Portfolio, Trade
 from .risk import RiskManager
+from .train import checkpoint_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,9 @@ class LiveTrader:
 
     def __init__(self, config: AppConfig, agent: DQNAgent,
                  provider: DataProvider | None = None,
-                 broker: BrokerAdapter | None = None) -> None:
+                 broker: BrokerAdapter | None = None,
+                 journal: TradeJournal | None = None,
+                 max_consecutive_errors: int = 10) -> None:
         """
         Args:
             config: configuración de la aplicación.
@@ -73,7 +77,14 @@ class LiveTrader:
                 :class:`~trading_agent.brokers.PaperBroker` (simulado)
                 sobre un portafolio con los costes de la config. Un broker
                 real (p. ej. Alpaca) trae su propio portafolio espejo.
+            journal: diario CSV de operaciones; ``None`` desactiva la
+                escritura en disco.
+            max_consecutive_errors: nº de iteraciones seguidas con error
+                inesperado tras el cual el bucle se detiene (cortacircuitos:
+                un proceso que falla sin parar no debe seguir operando).
         """
+        if max_consecutive_errors < 1:
+            raise TradingAgentError("max_consecutive_errors debe ser >= 1")
         self.config = config
         self.agent = agent
         self.provider = provider or make_provider(config.data)
@@ -87,8 +98,20 @@ class LiveTrader:
             ))
         self.broker = broker
         self.portfolio = broker.portfolio  # contabilidad compartida
-        self._stop_requested = False
-        self._last_bar_date = None  # arma el límite de pérdida diaria
+        self.journal = journal
+        self.max_consecutive_errors = max_consecutive_errors
+        # Evento de parada: la señal lo activa y el bucle despierta al
+        # instante en vez de agotar la espera entre iteraciones.
+        self._stop_event = threading.Event()
+        self._last_bar_date = None      # arma el límite de pérdida diaria
+        self._last_decided_bar = None   # el agente decide UNA vez por vela
+
+    def _record(self, trade: Trade, *, reason: str, price: float) -> None:
+        """Escribe una operación en el diario (si está activo)."""
+        if self.journal is not None:
+            self.journal.record(
+                trade, reason=reason,
+                equity=self.portfolio.equity({self.symbol: price}))
 
     # ------------------------------------------------------------------ #
     # Señales del sistema (Ctrl+C / SIGTERM del orquestador)             #
@@ -96,8 +119,13 @@ class LiveTrader:
     def install_signal_handlers(self) -> None:
         """Instala manejadores para parar limpiamente con SIGINT/SIGTERM."""
         def _handler(signum: int, _frame: FrameType | None) -> None:
+            if self._stop_event.is_set():
+                # Segunda señal: el operador quiere salir YA (la primera ya
+                # pidió parada limpia; la liquidación corre en el finally).
+                logger.warning("Segunda señal %s: salida forzada", signum)
+                raise SystemExit(130)
             logger.info("Señal %s recibida: parada limpia solicitada", signum)
-            self._stop_requested = True
+            self._stop_event.set()
 
         signal.signal(signal.SIGINT, _handler)
         signal.signal(signal.SIGTERM, _handler)
@@ -135,45 +163,78 @@ class LiveTrader:
     def run_once(self) -> dict[str, object]:
         """Ejecuta UNA iteración de decisión/ejecución.
 
+        Reglas de producción aplicadas en cada iteración:
+
+        - **Una decisión por vela**: el agente solo se consulta cuando la
+          marca temporal de la última vela cambia. Entre velas (mercado
+          cerrado, o sondeos más frecuentes que el intervalo) el mismo
+          estado produciría la misma acción y, con la posición ya
+          abierta/cerrada, el agente podría alternar compra/venta sobre
+          datos idénticos. Los stops sí se re-evalúan con cada precio.
+        - **Mercado abierto**: ninguna orden se envía si el broker informa
+          que el mercado está cerrado (quedaría colgada hasta el timeout).
+
         Returns:
             Dict de diagnóstico: ``price``, ``action`` (nombre), ``equity``,
-            ``has_position`` y ``forced_close``.
+            ``has_position``, ``forced_close``, ``stale_bar`` (``True`` si no
+            se consultó al agente por ser la misma vela) y ``market_closed``.
 
         Raises:
             DataProviderError / DataValidationError: si los datos fallan
                 (el llamador decide si continuar).
         """
         latest = self.provider.fetch_latest(self.symbol)
-        feats_df = build_features(latest)
+        # El estado se construye SOLO con velas completadas (como en el
+        # entrenamiento); la vela parcial en curso aporta el último precio.
+        completed = completed_bars(latest, self.config.data.interval)
+        feats_df = build_features(completed)
         feats = feats_df.loc[:, list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
-        price = float(latest.loc[feats_df.index[-1], "close"])
+        bar_ts = feats_df.index[-1]
+        price = float(latest["close"].iloc[-1])
+        tag = bar_ts.isoformat()  # id idempotente de las órdenes de esta vela
 
         equity = self.portfolio.equity({self.symbol: price})
         self.risk.update_equity(equity)
 
         # Nueva jornada (fecha de la última vela): arma el límite de
         # pérdida diaria con el equity de apertura del día.
-        bar_date = feats_df.index[-1].date()
+        bar_date = bar_ts.date()
         if bar_date != self._last_bar_date:
             self.risk.start_new_day(equity)
             self._last_bar_date = bar_date
+
+        market_open = self.broker.is_market_open()
+        if not market_open:
+            logger.info("%s: mercado cerrado, no se envían órdenes", self.symbol)
 
         # (3) Gestión de riesgo primero: los stops mandan sobre el agente.
         forced_close = None
         if self.portfolio.has_position(self.symbol):
             reason = self.risk.should_force_close(
                 self.portfolio.positions[self.symbol], price)
-            if reason is not None:
-                trade = self.broker.close_position(self.symbol, price)
+            if reason is not None and market_open:
+                trade = self.broker.close_position(self.symbol, price,
+                                                   tag=f"{tag}-{reason}")
                 forced_close = reason
+                self._record(trade, reason=reason, price=price)
                 logger.warning("%s: cierre forzoso por %s, P&L %.2f USD",
                                self.symbol, reason, trade.pnl)
+            elif reason is not None:
+                logger.warning("%s: %s pendiente hasta apertura de mercado",
+                               self.symbol, reason)
 
-        # (4) Decisión del agente (siempre greedy en producción).
-        state = self._build_state(feats, price)
-        action = Action(self.agent.act(state, greedy=True))
+        # (4) Decisión del agente (greedy), solo ante una vela nueva.
+        stale_bar = bar_ts == self._last_decided_bar
+        if stale_bar:
+            action = Action.HOLD
+        else:
+            state = self._build_state(feats, price)
+            action = Action(self.agent.act(state, greedy=True))
+            self._last_decided_bar = bar_ts
 
-        if action == Action.BUY and not self.portfolio.has_position(self.symbol):
+        if not market_open:
+            pass  # sin órdenes: la decisión se re-evaluará con la vela siguiente
+        elif action == Action.BUY and not self.portfolio.has_position(self.symbol):
             if self.risk.can_open(equity):
                 qty = self.risk.position_size(equity, price)
                 max_affordable = self.portfolio.cash / (
@@ -181,10 +242,13 @@ class LiveTrader:
                     * (1.0 + self.config.env.commission_pct))
                 qty = min(qty, float(int(max_affordable)))
                 if qty > 0:
-                    self.broker.open_position(self.symbol, qty, price)
+                    trade = self.broker.open_position(self.symbol, qty, price,
+                                                      tag=tag)
+                    self._record(trade, reason="agent", price=price)
                     logger.info("%s: COMPRA %g @ %.2f", self.symbol, qty, price)
         elif action == Action.SELL and self.portfolio.has_position(self.symbol):
-            trade = self.broker.close_position(self.symbol, price)
+            trade = self.broker.close_position(self.symbol, price, tag=tag)
+            self._record(trade, reason="agent", price=price)
             logger.info("%s: VENTA %g @ %.2f, P&L %.2f USD",
                         self.symbol, trade.quantity, price, trade.pnl)
 
@@ -195,6 +259,8 @@ class LiveTrader:
             "equity": equity,
             "has_position": self.portfolio.has_position(self.symbol),
             "forced_close": forced_close,
+            "stale_bar": stale_bar,
+            "market_closed": not market_open,
         }
 
     def run_forever(self, poll_seconds: float = 60.0,
@@ -214,33 +280,51 @@ class LiveTrader:
         if poll_seconds < 1:
             raise TradingAgentError("poll_seconds debe ser >= 1")
         self.install_signal_handlers()
-        logger.info("Bucle en vivo iniciado (paper trading) para %s cada %.0fs",
-                    self.symbol, poll_seconds)
+        logger.info("Bucle en vivo iniciado para %s cada %.0fs | broker: %s | "
+                    "endpoint: %s", self.symbol, poll_seconds,
+                    type(self.broker).__name__,
+                    getattr(self.broker, "base_url", "simulación local"))
 
         iteration = 0
-        while not self._stop_requested:
-            if max_iterations is not None and iteration >= max_iterations:
-                break
-            iteration += 1
-            try:
-                info = self.run_once()
-                logger.info("it %d | %s | precio %.2f | equity %.2f | %s",
-                            iteration, info["action"], info["price"],
-                            info["equity"],
-                            "EN POSICIÓN" if info["has_position"] else "en efectivo")
-                if self.risk.halted:
-                    logger.critical("Kill-switch de drawdown activo: fin del bucle")
+        consecutive_errors = 0
+        try:
+            while not self._stop_event.is_set():
+                if max_iterations is not None and iteration >= max_iterations:
                     break
-            except DataProviderError as exc:
-                # Transitorio: registrar y esperar al siguiente ciclo.
-                logger.error("Fallo de datos (se reintenta en el próximo "
-                             "ciclo): %s", exc)
-            except ExecutionError as exc:
-                logger.error("Fallo de ejecución: %s", exc)
-            time.sleep(poll_seconds)
-
-        self._liquidate()
-        logger.info("Bucle en vivo terminado tras %d iteraciones", iteration)
+                iteration += 1
+                try:
+                    info = self.run_once()
+                    consecutive_errors = 0
+                    logger.info("it %d | %s | precio %.2f | equity %.2f | %s%s",
+                                iteration, info["action"], info["price"],
+                                info["equity"],
+                                "EN POSICIÓN" if info["has_position"] else "en efectivo",
+                                " | misma vela" if info["stale_bar"] else "")
+                    if self.risk.halted:
+                        logger.critical("Kill-switch de drawdown activo: fin del bucle")
+                        break
+                except DataProviderError as exc:
+                    # Transitorio: registrar y esperar al siguiente ciclo.
+                    logger.error("Fallo de datos (se reintenta en el próximo "
+                                 "ciclo): %s", exc)
+                except ExecutionError as exc:
+                    logger.error("Fallo de ejecución: %s", exc)
+                except Exception:
+                    consecutive_errors += 1
+                    logger.exception(
+                        "Error inesperado en la iteración %d (%d/%d seguidos)",
+                        iteration, consecutive_errors, self.max_consecutive_errors)
+                    if consecutive_errors >= self.max_consecutive_errors:
+                        logger.critical("Cortacircuitos: %d errores seguidos. "
+                                        "Fin del bucle.", consecutive_errors)
+                        break
+                # Espera interrumpible: una señal despierta el bucle al instante.
+                self._stop_event.wait(poll_seconds)
+        finally:
+            # Pase lo que pase (señal, kill-switch, excepción no prevista),
+            # nunca se deja una posición abierta sin intentar liquidarla.
+            self._liquidate()
+            logger.info("Bucle en vivo terminado tras %d iteraciones", iteration)
 
     def _liquidate(self) -> None:
         """Cierra la posición abierta (si existe) al detener el bucle."""
@@ -249,15 +333,22 @@ class LiveTrader:
         try:
             latest = self.provider.fetch_latest(self.symbol)
             price = float(latest["close"].iloc[-1])
+            if not self.broker.is_market_open():
+                logger.error("Mercado cerrado: no se puede liquidar %s ahora. "
+                             "La posición sigue abierta en el broker; "
+                             "REVISAR MANUALMENTE.", self.symbol)
+                return
             trade = self.broker.close_position(self.symbol, price)
+            self._record(trade, reason="shutdown", price=price)
             logger.info("Liquidación final: %s P&L %.2f USD", self.symbol, trade.pnl)
-        except TradingAgentError as exc:
+        except Exception as exc:  # noqa: BLE001 - último recurso: avisar, no ocultar
             logger.error("No se pudo liquidar %s automáticamente: %s. "
                          "REVISAR MANUALMENTE.", self.symbol, exc)
 
 
 def build_live_trader(config: AppConfig, checkpoint_path: str,
-                      broker_name: str = "paper") -> LiveTrader:
+                      broker_name: str = "paper",
+                      journal_path: str | None = None) -> LiveTrader:
     """Construye un :class:`LiveTrader` con el checkpoint indicado.
 
     Args:
@@ -265,8 +356,10 @@ def build_live_trader(config: AppConfig, checkpoint_path: str,
         checkpoint_path: ruta del modelo entrenado (``.pt``).
         broker_name: ``"paper"`` (simulado, defecto) o ``"alpaca"``.
             Con un broker real, el portafolio espejo se crea sin costes
-            simulados (los costes reales vienen en cada fill) y su
-            efectivo se sincroniza con el de la cuenta del broker.
+            simulados (los costes reales vienen en cada fill) y se
+            sincronizan efectivo y posiciones abiertas con la cuenta.
+        journal_path: ruta del diario CSV de operaciones; ``None`` lo
+            desactiva.
 
     Returns:
         ``LiveTrader`` listo para :meth:`LiveTrader.run_forever`.
@@ -279,7 +372,10 @@ def build_live_trader(config: AppConfig, checkpoint_path: str,
     state_dim = (config.env.window_size * len(FEATURE_COLUMNS) + 2)
     agent_cfg = dataclasses.replace(config.agent, state_dim=state_dim)
     agent = DQNAgent(agent_cfg)
-    agent.load(checkpoint_path)
+    # Los metadatos del checkpoint deben coincidir con esta configuración
+    # (ventana, features, intervalo, símbolo): si no, no se opera.
+    agent.load(checkpoint_path,
+               expected_metadata=checkpoint_metadata(config, config.data.symbols[0]))
 
     if broker_name == "paper":
         broker = None  # LiveTrader crea el PaperBroker con la config
@@ -288,7 +384,8 @@ def build_live_trader(config: AppConfig, checkpoint_path: str,
         broker = make_broker(broker_name, Portfolio(
             cash=config.env.initial_cash, commission_pct=0.0,
             slippage_pct=0.0))
-        sync = getattr(broker, "sync_cash", None)
+        sync = getattr(broker, "sync", None)
         if callable(sync):
-            sync()
-    return LiveTrader(config, agent, broker=broker)
+            sync()  # efectivo + posiciones reales (sobrevive a reinicios)
+    journal = TradeJournal(journal_path) if journal_path else None
+    return LiveTrader(config, agent, broker=broker, journal=journal)

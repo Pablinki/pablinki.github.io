@@ -18,7 +18,11 @@ from trading_agent.config import (
     RiskConfig,
 )
 from trading_agent.data.provider import DataProvider
-from trading_agent.exceptions import DataProviderError, SecurityError
+from trading_agent.exceptions import (
+    DataProviderError,
+    SecurityError,
+    TradingAgentError,
+)
 from trading_agent.features import FEATURE_COLUMNS
 from trading_agent.live import LiveTrader
 from trading_agent.security import (
@@ -112,6 +116,160 @@ class TestRunForever:
         """El bucle NO debe morir por fallos de datos: los registra y sigue."""
         trader = make_trader(fail_data=True)
         trader.run_forever(poll_seconds=1.0, max_iterations=2)  # no lanza
+
+
+class ForcedAgent:
+    """Agente de prueba con acción fija (y conteo de consultas)."""
+
+    def __init__(self, action: int, state_dim: int) -> None:
+        self.action = action
+        self.calls = 0
+        self.config = type("Cfg", (), {"state_dim": state_dim})()
+
+    def act(self, state, *, greedy: bool = False) -> int:
+        self.calls += 1
+        return self.action
+
+
+class ClosedMarketBroker(PaperBroker):
+    def is_market_open(self) -> bool:
+        return False
+
+
+class ExplodingProvider(DataProvider):
+    """Proveedor que lanza un error NO tipado (bug inesperado)."""
+
+    def fetch_historical(self, symbol):
+        raise RuntimeError("bug inesperado")
+
+    def fetch_latest(self, symbol):
+        raise RuntimeError("bug inesperado")
+
+
+def make_forced_trader(action: int, broker=None, journal=None,
+                       provider=None, **kwargs) -> LiveTrader:
+    base = make_trader()
+    agent = ForcedAgent(action, base.config.env.window_size
+                        * len(FEATURE_COLUMNS) + 2)
+    return LiveTrader(base.config, agent, provider=provider or base.provider,
+                      broker=broker, journal=journal, **kwargs)
+
+
+class TestProductionGuards:
+    def test_agent_decides_once_per_bar(self):
+        """Misma vela -> no se consulta al agente (evita alternar compra/
+        venta sobre datos idénticos con el mercado cerrado)."""
+        from trading_agent.env import Action
+
+        trader = make_forced_trader(Action.BUY)
+        info1 = trader.run_once()
+        assert info1["action"] == "BUY" and info1["has_position"]
+        assert not info1["stale_bar"]
+        # El proveedor falso devuelve siempre las mismas velas.
+        info2 = trader.run_once()
+        assert info2["stale_bar"]
+        assert info2["action"] == "HOLD"
+        assert trader.agent.calls == 1
+
+    def test_no_orders_when_market_closed(self):
+        from trading_agent.env import Action
+        from trading_agent.portfolio import Portfolio
+
+        broker = ClosedMarketBroker(Portfolio(cash=100_000.0))
+        trader = make_forced_trader(Action.BUY, broker=broker)
+        info = trader.run_once()
+        assert info["market_closed"]
+        assert not info["has_position"]
+        assert broker.portfolio.cash == pytest.approx(100_000.0)
+
+    def test_forced_close_waits_for_market_open(self):
+        from trading_agent.env import Action
+        from trading_agent.portfolio import Portfolio, Position
+
+        broker = ClosedMarketBroker(Portfolio(cash=0.0))
+        # Posición muy perdedora: el stop-loss querría cerrar ya.
+        broker.portfolio.positions["TEST"] = Position("TEST", 1, 1e9)
+        trader = make_forced_trader(Action.HOLD, broker=broker)
+        info = trader.run_once()
+        assert info["forced_close"] is None  # pendiente hasta apertura
+        assert broker.portfolio.has_position("TEST")
+
+    def test_journal_records_agent_trades(self, tmp_path):
+        from trading_agent.env import Action
+        from trading_agent.journal import TradeJournal
+
+        journal = TradeJournal(tmp_path / "trades.csv")
+        trader = make_forced_trader(Action.BUY, journal=journal)
+        trader.run_once()
+        rows = (tmp_path / "trades.csv").read_text().splitlines()
+        assert len(rows) == 2  # cabecera + compra
+        assert ",TEST,buy," in rows[1]
+        assert rows[1].split(",")[7] == "agent"
+
+    def test_shutdown_liquidation_is_journaled(self, tmp_path):
+        from trading_agent.env import Action
+        from trading_agent.journal import TradeJournal
+
+        journal = TradeJournal(tmp_path / "trades.csv")
+        trader = make_forced_trader(Action.BUY, journal=journal)
+        trader.run_forever(poll_seconds=1.0, max_iterations=1)
+        rows = (tmp_path / "trades.csv").read_text().splitlines()
+        assert any("shutdown" in r for r in rows)
+        assert not trader.portfolio.has_position("TEST")
+
+    def test_unexpected_errors_do_not_kill_the_loop(self):
+        """Un bug no tipado se registra y el bucle continúa..."""
+        from trading_agent.env import Action
+
+        trader = make_forced_trader(
+            Action.HOLD, provider=ExplodingProvider(make_trader().config.data),
+            max_consecutive_errors=5)
+        trader.run_forever(poll_seconds=1.0, max_iterations=3)  # no lanza
+
+    def test_circuit_breaker_stops_after_consecutive_errors(self, caplog):
+        """...pero N errores seguidos activan el cortacircuitos."""
+        from trading_agent.env import Action
+
+        trader = make_forced_trader(
+            Action.HOLD, provider=ExplodingProvider(make_trader().config.data),
+            max_consecutive_errors=2)
+        with caplog.at_level("CRITICAL"):
+            trader.run_forever(poll_seconds=1.0, max_iterations=10)
+        assert "Cortacircuitos" in caplog.text
+
+    def test_partial_last_bar_is_not_used_for_the_state(self):
+        """Una vela todavía en formación no entra en el estado (el
+        entrenamiento solo vio velas completas), pero sí da el último precio."""
+        from trading_agent.env import Action
+
+        df = make_ohlcv(200)
+        # Reindexar para que la ÚLTIMA vela sea "hoy": todavía abierta.
+        today = pd.Timestamp.now(tz="UTC").normalize()
+        df.index = pd.date_range(end=today, periods=len(df), freq="D")
+        base = make_trader()
+        provider = FakeProvider(base.config.data, df=df)
+        trader = make_forced_trader(Action.HOLD, provider=provider)
+        info = trader.run_once()
+        assert trader._last_decided_bar == df.index[-2]   # última completa
+        assert info["price"] == pytest.approx(float(df["close"].iloc[-1]))
+
+    def test_stop_event_wakes_the_loop_immediately(self):
+        """Una señal no debe esperar el poll completo para parar."""
+        import time
+
+        from trading_agent.env import Action
+
+        trader = make_forced_trader(Action.HOLD)
+        trader._stop_event.set()  # equivale a recibir SIGINT antes de dormir
+        start = time.monotonic()
+        trader.run_forever(poll_seconds=30.0, max_iterations=5)
+        assert time.monotonic() - start < 5.0
+
+    def test_invalid_max_consecutive_errors_raises(self):
+        from trading_agent.env import Action
+
+        with pytest.raises(TradingAgentError):
+            make_forced_trader(Action.HOLD, max_consecutive_errors=0)
 
 
 class TestSecurity:

@@ -47,6 +47,9 @@ def main() -> int:
                              "'alpaca' usa la API de Alpaca (paper de Alpaca "
                              "por defecto; dinero real solo con "
                              "TRADING_AGENT_LIVE=YES y ALPACA_BASE_URL live)")
+    parser.add_argument("--journal", default="logs/trades.csv",
+                        help="Diario CSV de operaciones (cadena vacía para "
+                             "desactivarlo)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -56,7 +59,8 @@ def main() -> int:
     try:
         config = load_config(args.config)
         trader = build_live_trader(config, args.checkpoint,
-                                   broker_name=args.broker)
+                                   broker_name=args.broker,
+                                   journal_path=args.journal or None)
         trader.run_forever(
             poll_seconds=args.poll_seconds,
             max_iterations=args.max_iterations or None)

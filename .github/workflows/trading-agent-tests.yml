@@ -30,6 +30,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
+          pip install ruff==0.17.3
+
+      - name: Lint (ruff)
+        run: ruff check src scripts tests
 
       - name: Run test suite
         run: pytest -q
+
+      - name: Run doctests (documented examples must stay true)
+        run: pytest -q --doctest-modules src/trading_agent --ignore=src/trading_agent/data/bloomberg.py

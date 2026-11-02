@@ -128,7 +128,7 @@ class AgentConfig:
     gamma: float = 0.99
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
-    epsilon_decay: float = 0.995
+    epsilon_decay: float = 0.93  # 0.93**50 ≈ 0.03: llega al mínimo en ~40 episodios
     batch_size: int = 64
     buffer_capacity: int = 100_000
     min_buffer_size: int = 1_000

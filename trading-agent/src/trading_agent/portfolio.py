@@ -180,11 +180,53 @@ class Portfolio:
         self.trades.append(trade)
         return trade
 
+    def reduce_position(self, symbol: str, price: float, quantity: float) -> Trade:
+        """Vende ``quantity`` acciones de la posición (cierre parcial o total).
+
+        Aplica slippage adverso (vende a ``price * (1 - slippage_pct)``)
+        y comisión sobre el nocional. Si ``quantity`` iguala la posición,
+        esta se elimina (equivale a :meth:`close_position`).
+
+        Args:
+            symbol: ticker a vender.
+            price: precio de mercado de referencia (> 0).
+            quantity: nº de acciones a vender, en ``(0, posición]``.
+
+        Returns:
+            El :class:`Trade` de venta con el ``pnl`` realizado de la parte
+            vendida (neto de la comisión de salida).
+
+        Raises:
+            ExecutionError: si no hay posición, el precio es inválido o la
+                cantidad excede la posición.
+        """
+        if price <= 0:
+            raise ExecutionError(f"Precio inválido: {price}")
+        pos = self.positions.get(symbol)
+        if pos is None:
+            raise ExecutionError(f"No hay posición abierta en {symbol}")
+        if quantity <= 0 or quantity > pos.quantity:
+            raise ExecutionError(
+                f"Cantidad {quantity} inválida para la posición de "
+                f"{pos.quantity} en {symbol}")
+
+        exec_price = price * (1.0 - self.slippage_pct)
+        notional = exec_price * quantity
+        commission = notional * self.commission_pct
+        self.cash += notional - commission
+        pnl = (exec_price - pos.entry_price) * quantity - commission
+        if quantity == pos.quantity:
+            del self.positions[symbol]
+        else:
+            pos.quantity -= quantity
+        trade = Trade(symbol, "sell", quantity, exec_price, commission, pnl)
+        self.trades.append(trade)
+        return trade
+
     def close_position(self, symbol: str, price: float) -> Trade:
         """Cierra por completo la posición en ``symbol`` vendiendo a mercado.
 
-        Aplica slippage adverso (vende a ``price * (1 - slippage_pct)``)
-        y comisión sobre el nocional.
+        Equivale a :meth:`reduce_position` con toda la cantidad.
 
         Args:
             symbol: ticker a vender.
@@ -197,17 +239,7 @@ class Portfolio:
         Raises:
             ExecutionError: si no hay posición abierta o el precio es inválido.
         """
-        if price <= 0:
-            raise ExecutionError(f"Precio inválido: {price}")
-        pos = self.positions.pop(symbol, None)
+        pos = self.positions.get(symbol)
         if pos is None:
             raise ExecutionError(f"No hay posición abierta en {symbol}")
-
-        exec_price = price * (1.0 - self.slippage_pct)
-        notional = exec_price * pos.quantity
-        commission = notional * self.commission_pct
-        self.cash += notional - commission
-        pnl = (exec_price - pos.entry_price) * pos.quantity - commission
-        trade = Trade(symbol, "sell", pos.quantity, exec_price, commission, pnl)
-        self.trades.append(trade)
-        return trade
+        return self.reduce_position(symbol, price, pos.quantity)

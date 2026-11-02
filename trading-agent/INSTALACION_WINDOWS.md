@@ -169,9 +169,12 @@ python scripts\run_live.py --config config.yaml `
     --checkpoint checkpoints\dqn_best.pt --poll-seconds 60
 ```
 
-El agente consulta el precio cada 60 s, decide (HOLD/BUY/SELL) y lo simula
-sobre un portafolio virtual con comisiones y slippage. Se detiene
-limpiamente con **Ctrl+C** (liquida la posición abierta antes de salir).
+El agente consulta el precio cada 60 s, decide (HOLD/BUY/SELL) **una vez
+por vela nueva** y lo simula sobre un portafolio virtual con comisiones y
+slippage. Se detiene limpiamente con **Ctrl+C** (liquida la posición
+abierta antes de salir). Cada operación queda registrada en el diario
+`logs\trades.csv` (ábrelo con Excel para revisar el historial; cambia la
+ruta con `--journal`).
 
 > **Seguridad:** este modo es 100% simulado. El trading con dinero real
 > está deshabilitado por diseño salvo que definas explícitamente la

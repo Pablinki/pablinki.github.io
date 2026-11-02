@@ -17,7 +17,7 @@ agent:
   gamma: 0.99              # descuento de recompensas futuras
   epsilon_start: 1.0       # exploración inicial (100% aleatorio)
   epsilon_end: 0.05        # exploración mínima
-  epsilon_decay: 0.995     # decaimiento por episodio
+  epsilon_decay: 0.93      # decaimiento por episodio (0.93^50 ≈ 0.03: llega al mínimo en ~40 episodios)
   batch_size: 64
   buffer_capacity: 100000
   min_buffer_size: 1000    # calentamiento antes de aprender

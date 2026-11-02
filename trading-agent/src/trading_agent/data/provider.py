@@ -93,6 +93,54 @@ def validate_ohlcv(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df
 
 
+#: Duración de cada intervalo canónico de vela.
+INTERVAL_DURATION = {
+    "1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
+    "15m": pd.Timedelta(minutes=15), "30m": pd.Timedelta(minutes=30),
+    "1h": pd.Timedelta(hours=1), "60m": pd.Timedelta(hours=1),
+    "1d": pd.Timedelta(days=1),
+}
+
+
+def completed_bars(df: pd.DataFrame, interval: str,
+                   now: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Descarta la última vela si todavía está en formación.
+
+    Los proveedores devuelven la vela en curso con su cierre parcial. El
+    entrenamiento solo vio velas completas, así que en vivo el estado se
+    construye únicamente con velas cerradas (la vela parcial sirve solo
+    como último precio conocido para valorar y ejecutar).
+
+    Args:
+        df: OHLCV canónico (índice datetime UTC ascendente).
+        interval: intervalo canónico de las velas.
+        now: instante actual UTC (inyectable en tests); por defecto ahora.
+
+    Returns:
+        ``df`` sin la última fila si ``último_índice + duración > now``;
+        de lo contrario ``df`` intacto. Intervalos desconocidos devuelven
+        ``df`` intacto.
+
+    Ejemplo:
+        >>> idx = pd.to_datetime(["2024-01-02", "2024-01-03"], utc=True)
+        >>> df = pd.DataFrame({"close": [1.0, 2.0]}, index=idx)
+        >>> len(completed_bars(df, "1d", now=pd.Timestamp("2024-01-03 15:00", tz="UTC")))
+        1
+        >>> len(completed_bars(df, "1d", now=pd.Timestamp("2024-01-05", tz="UTC")))
+        2
+    """
+    duration = INTERVAL_DURATION.get(interval)
+    if duration is None or df.empty:
+        return df
+    now = now if now is not None else pd.Timestamp.now(tz="UTC")
+    last = df.index[-1]
+    if last.tzinfo is None:
+        last = last.tz_localize("UTC")
+    if last + duration > now:
+        return df.iloc[:-1]
+    return df
+
+
 def with_retries(fn: Callable[[], T], *, max_retries: int,
                  backoff_s: float, what: str) -> T:
     """Ejecuta ``fn`` reintentando ante fallos transitorios de datos.

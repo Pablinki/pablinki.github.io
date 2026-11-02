@@ -197,9 +197,15 @@ class BloombergProvider(DataProvider):
                             what=f"histórico Bloomberg {symbol}")
 
     def fetch_latest(self, symbol: str) -> pd.DataFrame:
-        """Últimas barras intradía (o última vela diaria)."""
+        """Últimas barras intradía (o últimas velas diarias).
+
+        El rango cubre con holgura el calentamiento de los indicadores
+        (~36 velas) más la ventana del estado: con velas diarias se piden
+        ~400 días naturales; intradía, 5 días.
+        """
         end = dt.datetime.now(dt.timezone.utc)
-        start = end - dt.timedelta(days=5)
+        lookback_days = 400 if self.config.interval == "1d" else 5
+        start = end - dt.timedelta(days=lookback_days)
 
         def _fetch() -> pd.DataFrame:
             if self.config.interval == "1d":

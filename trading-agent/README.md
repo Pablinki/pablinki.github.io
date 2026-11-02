@@ -150,9 +150,17 @@ El problema se formula como un **Proceso de Decisión de Markov**:
   - Pérdida Huber + recorte de gradiente + replay buffer de 100k
     transiciones + política ε-greedy con decaimiento por episodio.
 
-- **Anti *look-ahead bias***: el split train/validación es **temporal**
-  (nunca aleatorio) y el mejor checkpoint se elige por retorno en
-  validación (datos que el agente jamás vio al entrenar).
+- **Anti *look-ahead bias***: el histórico se divide **por tiempo** (nunca
+  aleatorio) en train (70%) / validación (15%) / **test** (15%). El mejor
+  checkpoint se elige por retorno en validación y, al terminar, se evalúa
+  una sola vez en el tramo de test, que nunca influyó ni en entrenar ni en
+  elegir: es la estimación honesta fuera de muestra.
+
+- **Métricas de evaluación** (`episode_summary`): retorno total,
+  benchmark **comprar-y-mantener** del mismo tramo y exceso sobre él,
+  **drawdown máximo**, **Sharpe** anualizado, *profit factor*, nº de
+  operaciones y *win rate*. El log de entrenamiento muestra el B&H de
+  validación en cada episodio y las métricas de test al final.
 
 - **Realismo del backtest**: cada operación paga **comisión** y sufre
   **slippage** adverso configurables; al terminar el episodio la posición
@@ -270,6 +278,44 @@ Escalera de despliegue recomendada: (1) `--broker paper` semanas,
 adaptador rechaza arrancar en live (`SecurityError`). Ten presente la
 regla *Pattern Day Trader* de EE. UU. (25.000 USD mínimos para >3
 day-trades en 5 días hábiles) si usas intervalos intradía.
+
+## Operación en producción
+
+Reglas que aplica el bucle en vivo (`LiveTrader`) para funcionar 24/7 sin
+supervisión:
+
+- **Una decisión por vela**: el agente solo se consulta cuando cambia la
+  marca temporal de la última vela. Con el mercado cerrado (o sondeando
+  más rápido que el intervalo) el mismo estado produciría la misma acción
+  y el agente alternaría compra/venta sobre datos idénticos. Los stops sí
+  se re-evalúan con cada precio.
+- **Reloj de mercado**: con un broker real no se envía ninguna orden si el
+  mercado está cerrado (quedaría colgada hasta el timeout). Un stop-loss
+  pendiente se ejecuta en la primera iteración con mercado abierto.
+- **Diario de operaciones** (`--journal logs/trades.csv`, activo por
+  defecto): cada compra, venta, cierre forzoso y liquidación queda en un
+  CSV *append-only* con timestamp UTC, precio, comisión, P&L, motivo y
+  equity — la fuente de verdad para reconciliar contra el broker.
+- **Reinicios seguros**: con Alpaca, al arrancar se sincronizan efectivo
+  y posiciones abiertas reales en el espejo local, así una posición
+  abierta antes de un reinicio sigue protegida por el RiskManager.
+- **Cortacircuitos**: un error no previsto se registra con traza y el
+  bucle continúa; `max_consecutive_errors` (10) errores seguidos lo
+  detienen. Pase lo que pase (señal, kill-switch, excepción), la
+  liquidación final se intenta siempre (`finally`).
+- **Docker**: `Dockerfile` listo para desplegar (imagen `python:3.11-slim`,
+  torch CPU, usuario sin privilegios, `SIGTERM` → parada limpia):
+
+  ```bash
+  docker build -t trading-agent .
+  docker run -d --restart unless-stopped --name trader \
+      -v $(pwd)/checkpoints:/app/checkpoints -v $(pwd)/logs:/app/logs \
+      -e ALPACA_API_KEY -e ALPACA_SECRET_KEY \
+      trading-agent python scripts/run_live.py --broker alpaca
+  ```
+
+- **CI**: en cada push/PR, GitHub Actions ejecuta lint (`ruff`), la suite
+  completa y los doctests (los ejemplos de la documentación se verifican).
 
 ## Escalabilidad
 

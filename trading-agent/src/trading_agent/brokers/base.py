@@ -42,7 +42,7 @@ class BrokerAdapter(abc.ABC):
 
     @abc.abstractmethod
     def open_position(self, symbol: str, quantity: float,
-                      price_hint: float) -> Trade:
+                      price_hint: float, *, tag: str | None = None) -> Trade:
         """Compra ``quantity`` acciones de ``symbol`` a mercado.
 
         Args:
@@ -51,6 +51,9 @@ class BrokerAdapter(abc.ABC):
             price_hint: último precio conocido (el simulador ejecuta a
                 este precio; un broker real lo usa solo como referencia
                 de logging/validación — el fill manda).
+            tag: identificador de la decisión (p. ej. la marca temporal de
+                la vela) que un broker real usa como id de orden
+                idempotente; el simulador lo ignora.
 
         Returns:
             El ``Trade`` de compra reflejado en el portafolio local.
@@ -59,13 +62,27 @@ class BrokerAdapter(abc.ABC):
             ExecutionError / InsufficientFundsError / SecurityError.
         """
 
+    def is_market_open(self) -> bool:
+        """¿Acepta el mercado órdenes ahora mismo?
+
+        El simulador siempre responde ``True``; un broker real consulta el
+        reloj de mercado para no enviar órdenes que no pueden ejecutarse
+        (quedarían colgadas hasta el timeout y se cancelarían).
+
+        Returns:
+            ``True`` si se pueden enviar órdenes ejecutables.
+        """
+        return True
+
     @abc.abstractmethod
-    def close_position(self, symbol: str, price_hint: float) -> Trade:
+    def close_position(self, symbol: str, price_hint: float, *,
+                       tag: str | None = None) -> Trade:
         """Cierra por completo la posición abierta en ``symbol`` a mercado.
 
         Args:
             symbol: ticker a vender.
             price_hint: último precio conocido (ver ``open_position``).
+            tag: identificador de la decisión (ver ``open_position``).
 
         Returns:
             El ``Trade`` de venta, con el P&L realizado.
@@ -91,10 +108,11 @@ class PaperBroker(BrokerAdapter):
     """
 
     def open_position(self, symbol: str, quantity: float,
-                      price_hint: float) -> Trade:
+                      price_hint: float, *, tag: str | None = None) -> Trade:
         """Ver contrato en :meth:`BrokerAdapter.open_position`."""
         return self.portfolio.open_position(symbol, price_hint, quantity)
 
-    def close_position(self, symbol: str, price_hint: float) -> Trade:
+    def close_position(self, symbol: str, price_hint: float, *,
+                       tag: str | None = None) -> Trade:
         """Ver contrato en :meth:`BrokerAdapter.close_position`."""
         return self.portfolio.close_position(symbol, price_hint)

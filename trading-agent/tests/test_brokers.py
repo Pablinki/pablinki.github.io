@@ -72,8 +72,12 @@ class FakeSession:
 ACCOUNT_OK = {"status": "ACTIVE", "cash": "50000.00"}
 
 
-def order_json(status: str, *, order_id: str = "ord-1", qty: str = "10",
+def order_json(status: str, *, order_id: str = "ord-1", qty: str | None = None,
                price: str = "100.50") -> dict:
+    """Orden JSON como la devuelve Alpaca: sin fill salvo que esté ``filled``
+    (o se indique ``qty`` explícitamente para fills parciales)."""
+    if qty is None:
+        qty = "10" if status == "filled" else "0"
     return {"id": order_id, "status": status, "filled_qty": qty,
             "filled_avg_price": price}
 
@@ -159,6 +163,14 @@ class TestAlpacaSecurity:
         assert session.headers["APCA-API-KEY-ID"] == "clave-test"
         assert session.headers["APCA-API-SECRET-KEY"] == "secreto-test"
 
+    def test_plain_http_url_is_rejected(self, monkeypatch):
+        """Las credenciales viajan en cabeceras: nunca sin TLS."""
+        monkeypatch.setenv("ALPACA_API_KEY", "k")
+        monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+        monkeypatch.setenv("ALPACA_BASE_URL", "http://paper-api.alpaca.markets")
+        with pytest.raises(SecurityError, match="https"):
+            AlpacaBroker(Portfolio(cash=1.0), session=FakeSession())
+
 
 # --------------------------------------------------------------------- #
 # AlpacaBroker: cuenta y órdenes                                        #
@@ -184,6 +196,56 @@ class TestAlpacaAccount:
         broker = make_alpaca(monkeypatch, session)
         with pytest.raises(ExecutionError, match="no activa"):
             broker.account_cash()
+
+
+class TestAlpacaSync:
+    def test_sync_positions_mirrors_open_longs(self, monkeypatch):
+        """Tras un reinicio, las posiciones reales deben volver al espejo
+        (si no, el RiskManager no las vería: sin stop-loss)."""
+        session = FakeSession()
+        session.queue("GET", "/v2/positions", payload=[
+            {"symbol": "AAPL", "qty": "10", "side": "long",
+             "avg_entry_price": "123.45"},
+        ])
+        broker = make_alpaca(monkeypatch, session)
+        broker.sync_positions()
+        pos = broker.portfolio.positions["AAPL"]
+        assert pos.quantity == 10
+        assert pos.entry_price == pytest.approx(123.45)
+
+    def test_sync_positions_rejects_shorts(self, monkeypatch):
+        session = FakeSession()
+        session.queue("GET", "/v2/positions", payload=[
+            {"symbol": "AAPL", "qty": "-10", "side": "short",
+             "avg_entry_price": "1"},
+        ])
+        broker = make_alpaca(monkeypatch, session)
+        with pytest.raises(ExecutionError, match="no soportada"):
+            broker.sync_positions()
+
+    def test_sync_does_cash_and_positions(self, monkeypatch):
+        session = FakeSession()
+        session.queue("GET", "/v2/account", payload=ACCOUNT_OK)
+        session.queue("GET", "/v2/positions", payload=[])
+        broker = make_alpaca(monkeypatch, session, cash=1.0)
+        broker.sync()
+        assert broker.portfolio.cash == pytest.approx(50_000.0)
+        assert broker.portfolio.positions == {}
+
+    def test_market_clock(self, monkeypatch):
+        session = FakeSession()
+        session.queue("GET", "/v2/clock", payload={"is_open": True})
+        session.queue("GET", "/v2/clock", payload={"is_open": False})
+        broker = make_alpaca(monkeypatch, session)
+        assert broker.is_market_open() is True
+        assert broker.is_market_open() is False
+
+    def test_market_clock_failure_is_closed(self, monkeypatch):
+        """Si no se puede saber, no operar es la opción segura."""
+        session = FakeSession()
+        session.queue("GET", "/v2/clock", status_code=500, payload={})
+        broker = make_alpaca(monkeypatch, session)
+        assert broker.is_market_open() is False
 
 
 class TestAlpacaOrders:
@@ -229,6 +291,52 @@ class TestAlpacaOrders:
         trade = broker.close_position("AAPL", price_hint=109.0)
         assert trade.pnl == pytest.approx(100.0)
         assert not broker.portfolio.has_position("AAPL")
+
+    def test_client_order_id_is_sent_and_duplicate_is_recovered(self, monkeypatch):
+        """Idempotencia: si Alpaca ya tiene la orden (422 por client_order_id
+        duplicado), se recupera por id en vez de comprar dos veces."""
+        session = FakeSession()
+        session.queue("POST", "/v2/orders", status_code=422,
+                      payload={"message": "client_order_id must be unique"})
+        session.queue("GET", "client_order_id=ta-AAPL-buy-2026-01-02T15-00-00",
+                      payload=order_json("new", order_id="ord-9"))
+        session.queue("GET", "/v2/orders/ord-9",
+                      payload=order_json("filled", order_id="ord-9"))
+        broker = make_alpaca(monkeypatch, session)
+        trade = broker.open_position("AAPL", quantity=10, price_hint=100.0,
+                                     tag="2026-01-02T15:00:00")
+        assert trade.quantity == 10
+        posted = [c for c in session.calls if c[0] == "POST"]
+        assert posted[0][2]["client_order_id"] == "ta-AAPL-buy-2026-01-02T15-00-00"
+        assert len(posted) == 1  # no se reenvió la compra
+
+    def test_timeout_with_partial_fill_mirrors_filled_shares(self, monkeypatch):
+        """Tras cancelar por timeout, las acciones ya ejecutadas son reales:
+        deben entrar en el espejo (antes se descartaban)."""
+        session = FakeSession()
+        session.queue("POST", "/v2/orders", payload=order_json("new"))
+        session.queue("GET", "/v2/orders/ord-1", sticky=True,
+                      payload=order_json("partially_filled", qty="3"))
+        session.queue("DELETE", "/v2/orders/ord-1", status_code=204)
+        broker = make_alpaca(monkeypatch, session, order_timeout_s=0.01)
+        trade = broker.open_position("AAPL", quantity=10, price_hint=100.0)
+        assert trade.quantity == 3
+        assert broker.portfolio.positions["AAPL"].quantity == 3
+
+    def test_partial_sell_reduces_mirror_position(self, monkeypatch):
+        session = FakeSession()
+        session.queue("POST", "/v2/orders", payload=order_json("new"))
+        session.queue("GET", "/v2/orders/ord-1", payload=order_json("filled"))
+        session.queue("POST", "/v2/orders",
+                      payload=order_json("new", order_id="ord-2"))
+        session.queue("GET", "/v2/orders/ord-2",
+                      payload=order_json("canceled", order_id="ord-2", qty="4",
+                                         price="105"))
+        broker = make_alpaca(monkeypatch, session)
+        broker.open_position("AAPL", quantity=10, price_hint=100.0)
+        trade = broker.close_position("AAPL", price_hint=105.0)
+        assert trade.quantity == 4
+        assert broker.portfolio.positions["AAPL"].quantity == 6  # resto abierto
 
     def test_rejected_order_raises(self, monkeypatch):
         session = FakeSession()

@@ -82,6 +82,30 @@ class TestClosePosition:
         assert p.trades[1].pnl == pytest.approx(-50.0)
 
 
+class TestReducePosition:
+    def test_partial_sale_keeps_remainder(self):
+        p = make_portfolio()
+        p.open_position("AAPL", price=100.0, quantity=10)
+        trade = p.reduce_position("AAPL", price=110.0, quantity=4)
+        assert trade.quantity == 4
+        assert trade.pnl == pytest.approx(40.0)
+        assert p.positions["AAPL"].quantity == 6
+        assert p.cash == pytest.approx(9_000.0 + 440.0)
+
+    def test_full_quantity_closes(self):
+        p = make_portfolio()
+        p.open_position("AAPL", price=100.0, quantity=10)
+        p.reduce_position("AAPL", price=100.0, quantity=10)
+        assert not p.has_position("AAPL")
+
+    @pytest.mark.parametrize("qty", [0, -1, 11])
+    def test_invalid_quantity_raises(self, qty):
+        p = make_portfolio()
+        p.open_position("AAPL", price=100.0, quantity=10)
+        with pytest.raises(ExecutionError, match="inválida"):
+            p.reduce_position("AAPL", price=100.0, quantity=qty)
+
+
 class TestEquity:
     def test_equity_marks_positions_to_market(self):
         p = make_portfolio()

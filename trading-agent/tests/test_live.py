@@ -302,7 +302,8 @@ class TestProductionGuards:
         trader = make_forced_trader(Action.HOLD, broker=broker)
         trader.run_once()                 # primera jornada: sin reconciliar
         assert broker.syncs == 0
-        trader._last_bar_date = None      # fuerza "nueva jornada"
+        import datetime as dt
+        trader._last_bar_date = dt.date(2000, 1, 1)   # fuerza "nueva jornada"
         with caplog.at_level("CRITICAL"):
             trader.run_once()
         assert broker.syncs == 1

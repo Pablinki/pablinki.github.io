@@ -6,19 +6,27 @@ import dataclasses
 
 import pandas as pd
 import pytest
+from conftest import make_ohlcv
 
 from trading_agent.agent.dqn import DQNAgent
-from trading_agent.config import (AgentConfig, AppConfig, DataConfig,
-                                  EnvConfig, RiskConfig)
+from trading_agent.config import (
+    AgentConfig,
+    AppConfig,
+    DataConfig,
+    EnvConfig,
+    RiskConfig,
+)
 from trading_agent.data.provider import DataProvider
 from trading_agent.exceptions import DataProviderError, SecurityError
 from trading_agent.features import FEATURE_COLUMNS
 from trading_agent.live import LiveTrader
-from trading_agent.security import (LIVE_TRADING_ENV_VAR,
-                                    assert_live_trading_allowed, get_secret,
-                                    is_live_trading_enabled, mask_secret)
-
-from conftest import make_ohlcv
+from trading_agent.security import (
+    LIVE_TRADING_ENV_VAR,
+    assert_live_trading_allowed,
+    get_secret,
+    is_live_trading_enabled,
+    mask_secret,
+)
 
 
 class FakeProvider(DataProvider):
@@ -63,6 +71,14 @@ class TestRunOnce:
     def test_data_failure_propagates_for_caller_to_handle(self):
         with pytest.raises(DataProviderError):
             make_trader(fail_data=True).run_once()
+
+    def test_daily_loss_limit_gets_armed(self):
+        """run_once debe armar el límite de pérdida diaria con la fecha de
+        la última vela (antes era código muerto en vivo)."""
+        trader = make_trader()
+        assert trader.risk.day_start_equity is None
+        trader.run_once()
+        assert trader.risk.day_start_equity is not None
 
     def test_equity_is_conserved_without_trades(self):
         trader = make_trader()

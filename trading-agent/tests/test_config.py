@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from trading_agent.config import (AgentConfig, AppConfig, DataConfig,
-                                  EnvConfig, RiskConfig, load_config)
+from trading_agent.config import (
+    AgentConfig,
+    AppConfig,
+    DataConfig,
+    EnvConfig,
+    RiskConfig,
+    load_config,
+)
 from trading_agent.exceptions import ConfigurationError
 
 

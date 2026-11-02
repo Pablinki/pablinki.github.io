@@ -115,6 +115,25 @@ class TestRewardAlignment:
         assert total_reward == pytest.approx(expected, rel=1e-6)
 
 
+    def test_reward_includes_final_liquidation_costs(self, small_ohlcv):
+        """Con comisiones y slippage, la suma de recompensas debe seguir
+        reconstruyendo el log-retorno final (liquidación incluida)."""
+        cfg = EnvConfig(window_size=10, commission_pct=0.002,
+                        slippage_pct=0.001, reward_scaling=100.0)
+        env = TradingEnvironment(small_ohlcv, cfg, RiskConfig(
+            stop_loss_pct=0.99, take_profit_pct=None, max_drawdown_pct=1.0))
+        env.reset()
+        total_reward = 0.0
+        done = False
+        first = True
+        while not done:
+            _, r, done, info = env.step(Action.BUY if first else Action.HOLD)
+            first = False
+            total_reward += r
+        expected = np.log(info["equity"] / cfg.initial_cash) * cfg.reward_scaling
+        assert total_reward == pytest.approx(expected, rel=1e-6)
+
+
 class TestRiskIntegration:
     def test_stop_loss_forces_close(self, small_ohlcv):
         """Con un stop minúsculo, cualquier caída fuerza el cierre."""
@@ -131,6 +150,15 @@ class TestRiskIntegration:
             if info["forced_close"]:
                 closes.append(info["forced_close"])
         assert "stop_loss" in closes
+
+    def test_daily_loss_limit_is_armed(self, small_ohlcv):
+        """El límite de pérdida diaria debe armarse en reset y rearmarse al
+        cambiar el día de calendario (antes era código muerto)."""
+        env = make_env(small_ohlcv)
+        env.reset()
+        assert env.risk.day_start_equity == pytest.approx(100_000.0)
+        env.step(Action.HOLD)  # velas diarias: cada paso es un día nuevo
+        assert env.risk.day_start_equity is not None
 
     def test_position_size_respects_limit(self, small_ohlcv):
         env = make_env(small_ohlcv)

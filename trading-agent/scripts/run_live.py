@@ -27,9 +27,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from trading_agent.config import load_config            # noqa: E402
-from trading_agent.exceptions import TradingAgentError  # noqa: E402
-from trading_agent.live import build_live_trader        # noqa: E402
+from trading_agent.config import load_config
+from trading_agent.exceptions import TradingAgentError
+from trading_agent.live import build_live_trader
 
 
 def main() -> int:
@@ -55,7 +55,8 @@ def main() -> int:
             max_iterations=args.max_iterations or None)
         return 0
     except TradingAgentError as exc:
-        logging.error("El trader terminó con error controlado: %s", exc)
+        logging.getLogger(__name__).error(
+            "El trader terminó con error controlado: %s", exc)
         return 1
 
 

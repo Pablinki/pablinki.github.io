@@ -26,6 +26,32 @@ from .provider import DataProvider, validate_ohlcv, with_retries
 logger = logging.getLogger(__name__)
 
 
+def latest_period_for_interval(interval: str) -> str:
+    """Periodo yfinance a pedir en ``fetch_latest`` según la granularidad.
+
+    Debe cubrir con holgura el calentamiento de los indicadores técnicos
+    (~36 velas) más la ventana del estado: con velas diarias, 5 días no
+    bastan; se pide 1 año. Yahoo limita el intradía fino a ~7 días.
+
+    Args:
+        interval: intervalo canónico (``"1m"``, ``"5m"``, ``"1h"``, ``"1d"``...).
+
+    Returns:
+        Cadena de periodo válida para yfinance (``"5d"``, ``"3mo"``, ``"1y"``).
+
+    Ejemplo:
+        >>> latest_period_for_interval("1d")
+        '1y'
+        >>> latest_period_for_interval("1m")
+        '5d'
+    """
+    if interval == "1d":
+        return "1y"
+    if interval in ("1h", "60m", "90m"):
+        return "3mo"
+    return "5d"
+
+
 class YahooFinanceProvider(DataProvider):
     """Implementación de :class:`DataProvider` sobre ``yfinance``."""
 
@@ -40,25 +66,35 @@ class YahooFinanceProvider(DataProvider):
         today = dt.date.today().isoformat()
         return d / f"{symbol}_{self.config.interval}_{today}.parquet"
 
-    def _download(self, symbol: str, *, period: str) -> pd.DataFrame:
+    def _download(self, symbol: str, *, period: str | None = None,
+                  start: dt.datetime | None = None,
+                  end: dt.datetime | None = None) -> pd.DataFrame:
         """Descarga cruda desde yfinance y normaliza al formato canónico.
+
+        Yahoo solo acepta periodos predefinidos (``"5d"``, ``"1y"``,
+        ``"max"``...); un rango arbitrario de días se pide con fechas
+        ``start``/``end`` explícitas.
 
         Args:
             symbol: ticker.
-            period: periodo yfinance (``"730d"``, ``"1d"``, ``"max"``...).
+            period: periodo yfinance predefinido (excluyente con start/end).
+            start: inicio del rango (requiere ``end``).
+            end: fin del rango.
 
         Returns:
             DataFrame OHLCV canónico validado.
         """
         import yfinance as yf  # import perezoso: facilita testear sin red
 
+        kwargs: dict = {"period": period} if period is not None \
+            else {"start": start, "end": end}
         raw = yf.download(
             tickers=symbol,
-            period=period,
             interval=self.config.interval,
             auto_adjust=True,     # precios ajustados por splits/dividendos
             progress=False,
             threads=False,
+            **kwargs,
         )
         if raw is None or raw.empty:
             raise DataProviderError(f"yfinance devolvió vacío para {symbol!r}")
@@ -75,9 +111,10 @@ class YahooFinanceProvider(DataProvider):
             logger.info("Cargando %s desde caché %s", symbol, cache)
             return pd.read_parquet(cache)
 
-        period = f"{self.config.lookback_days}d"
+        end = dt.datetime.now(dt.timezone.utc)
+        start = end - dt.timedelta(days=self.config.lookback_days)
         df = with_retries(
-            lambda: self._download(symbol, period=period),
+            lambda: self._download(symbol, start=start, end=end),
             max_retries=self.config.max_retries,
             backoff_s=self.config.retry_backoff_s,
             what=f"histórico {symbol}",
@@ -89,9 +126,15 @@ class YahooFinanceProvider(DataProvider):
         return df
 
     def fetch_latest(self, symbol: str) -> pd.DataFrame:
-        """Últimas velas del día en curso (sin caché: siempre frescas)."""
+        """Últimas velas (sin caché: siempre frescas).
+
+        El periodo pedido depende del intervalo (ver
+        :func:`latest_period_for_interval`) para cubrir siempre el
+        calentamiento de los indicadores más la ventana del estado.
+        """
+        period = latest_period_for_interval(self.config.interval)
         return with_retries(
-            lambda: self._download(symbol, period="5d"),
+            lambda: self._download(symbol, period=period),
             max_retries=self.config.max_retries,
             backoff_s=self.config.retry_backoff_s,
             what=f"último precio {symbol}",

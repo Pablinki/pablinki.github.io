@@ -14,7 +14,7 @@ from trading_agent.features import FEATURE_COLUMNS, build_features
 class TestValidateOhlcv:
     def test_valid_frame_passes(self, ohlcv):
         out = validate_ohlcv(ohlcv, "TEST")
-        assert list(out.columns) == list(("open", "high", "low", "close", "volume"))
+        assert list(out.columns) == ["open", "high", "low", "close", "volume"]
         assert str(out.index.tz) == "UTC"
 
     def test_empty_frame_raises(self):

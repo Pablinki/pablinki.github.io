@@ -121,6 +121,8 @@ class TradingEnvironment:
         # Precio de cierre alineado con las filas de features supervivientes.
         self._prices = ohlcv.loc[self._features.index, "close"].to_numpy()
         self._feat_matrix = self._features.to_numpy(dtype=np.float32)
+        # Fechas de calendario por vela: arman el límite de pérdida diaria.
+        self._dates = self._features.index.date
 
         n_steps = len(self._features) - env_config.window_size
         if n_steps < 2:
@@ -154,6 +156,7 @@ class TradingEnvironment:
         )
         self.risk.reset()
         self.risk.update_equity(self.env_config.initial_cash)
+        self.risk.start_new_day(self.env_config.initial_cash)
         self._done = False
         return self._observe()
 
@@ -163,10 +166,13 @@ class TradingEnvironment:
         Orden de eventos dentro del paso (importante para el realismo):
 
         1. Se ejecuta la acción del agente al precio de cierre actual.
-        2. Se avanza el tiempo a la vela siguiente.
+        2. Se avanza el tiempo a la vela siguiente (si cambia el día de
+           calendario se arma el límite de pérdida diaria).
         3. El RiskManager evalúa stop-loss/take-profit al precio nuevo y
            puede forzar un cierre.
-        4. Se calcula la recompensa como Δlog(equity).
+        4. Si el episodio termina, se liquida la posición restante.
+        5. Se calcula la recompensa como Δlog(equity), incluyendo los
+           costes de la liquidación final si la hubo.
 
         Args:
             action: entero en ``{0, 1, 2}`` (ver :class:`Action`).
@@ -196,9 +202,13 @@ class TradingEnvironment:
         # (1) Ejecutar la decisión del agente.
         self._apply_action(action, price, equity_before)
 
-        # (2) Avanzar el tiempo.
+        # (2) Avanzar el tiempo. Si cambia el día de calendario, se arma el
+        # límite de pérdida diaria con el equity de apertura de la jornada.
         self._t += 1
         new_price = float(self._prices[self._t])
+        if self._dates[self._t] != self._dates[self._t - 1]:
+            self.risk.start_new_day(
+                self._portfolio.equity({self.symbol: new_price}))
 
         # (3) Cierres forzosos por gestión de riesgo.
         forced_close = None
@@ -209,17 +219,20 @@ class TradingEnvironment:
                 self._portfolio.close_position(self.symbol, new_price)
                 forced_close = reason
 
-        # (4) Recompensa = Δ log-equity escalado.
-        equity_after = self._portfolio.equity({self.symbol: new_price})
-        reward = (np.log(equity_after / equity_before)
-                  * self.env_config.reward_scaling)
-
-        self.risk.update_equity(equity_after)
+        # (4) Fin de episodio y liquidación ANTES de calcular la recompensa:
+        # así los costes de la liquidación final también quedan reflejados
+        # en la señal de aprendizaje.
+        self.risk.update_equity(
+            self._portfolio.equity({self.symbol: new_price}))
         self._done = (self._t >= len(self._prices) - 1) or self.risk.halted
         if self._done and self._portfolio.has_position(self.symbol):
             # Liquidación final: el episodio se evalúa todo en efectivo.
             self._portfolio.close_position(self.symbol, new_price)
-            equity_after = self._portfolio.cash
+
+        # (5) Recompensa = Δ log-equity escalado.
+        equity_after = self._portfolio.equity({self.symbol: new_price})
+        reward = (np.log(equity_after / equity_before)
+                  * self.env_config.reward_scaling)
 
         info = {
             "t": self._t,

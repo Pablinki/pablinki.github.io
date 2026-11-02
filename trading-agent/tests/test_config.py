@@ -53,6 +53,18 @@ class TestValidation:
     def test_valid_ticker_shapes(self, symbol):
         assert DataConfig(symbols=(symbol,)).symbols == (symbol,)
 
+    def test_unsupported_interval_raises(self):
+        with pytest.raises(ConfigurationError, match="interval"):
+            DataConfig(interval="2h")
+
+    def test_yahoo_intraday_lookback_limit(self):
+        with pytest.raises(ConfigurationError, match="Yahoo"):
+            DataConfig(interval="1m", lookback_days=30)
+        assert DataConfig(interval="1m", lookback_days=7).lookback_days == 7
+        # Bloomberg no tiene ese límite.
+        assert DataConfig(provider="bloomberg", interval="1m",
+                          lookback_days=30).lookback_days == 30
+
     def test_cooldown_bars_validation(self):
         assert RiskConfig(cooldown_bars=3).cooldown_bars == 3
         with pytest.raises(ConfigurationError):

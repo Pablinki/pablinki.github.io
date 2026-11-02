@@ -31,7 +31,12 @@ from typing import TypeVar
 import pandas as pd
 
 from ..config import DataConfig
-from ..exceptions import ConfigurationError, DataProviderError, DataValidationError
+from ..exceptions import (
+    ConfigurationError,
+    DataProviderError,
+    DataValidationError,
+    RateLimitError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +91,21 @@ def validate_ohlcv(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
     if df.empty:
         raise DataValidationError(f"{symbol}: todas las filas tenían NaN")
-    if (df[["open", "high", "low", "close"]] <= 0).any().any():
-        raise DataValidationError(f"{symbol}: hay precios <= 0")
-    if (df["volume"] < 0).any():
-        raise DataValidationError(f"{symbol}: hay volúmenes negativos")
+
+    # Una vela corrupta aislada (precio <= 0, volumen negativo) no debe
+    # invalidar toda la ventana y parar el trading: se descarta con aviso.
+    # Si la corrupción es generalizada (> 1% de las filas), el origen no
+    # es fiable y sí se rechaza.
+    bad = ((df[["open", "high", "low", "close"]] <= 0).any(axis=1)
+           | (df["volume"] < 0))
+    n_bad = int(bad.sum())
+    if n_bad:
+        if n_bad > max(1, len(df) // 100):
+            raise DataValidationError(
+                f"{symbol}: {n_bad} velas con precios <= 0 o volumen negativo")
+        logger.warning("%s: %d vela(s) corrupta(s) descartada(s): %s", symbol,
+                       n_bad, list(df.index[bad].astype(str)))
+        df = df[~bad]
     return df
 
 
@@ -168,8 +184,8 @@ def with_retries(fn: Callable[[], T], *, max_retries: int,
     for attempt in range(max_retries + 1):
         try:
             return fn()
-        except DataValidationError:
-            raise  # datos corruptos: reintentar es inútil
+        except (DataValidationError, RateLimitError):
+            raise  # datos corruptos o tasa limitada: reintentar ya es inútil
         except Exception as exc:  # noqa: BLE001 - la red falla de mil formas
             last_exc = exc
             if attempt < max_retries:

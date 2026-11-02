@@ -25,9 +25,18 @@ class TestValidateOhlcv:
         with pytest.raises(DataValidationError, match="faltan columnas"):
             validate_ohlcv(ohlcv.drop(columns=["close"]), "TEST")
 
-    def test_negative_price_raises(self, ohlcv):
+    def test_isolated_bad_bar_is_dropped_with_warning(self, ohlcv, caplog):
+        """Una vela corrupta aislada no debe parar el trading: se descarta."""
         bad = ohlcv.copy()
         bad.iloc[5, bad.columns.get_loc("close")] = -1.0
+        with caplog.at_level("WARNING"):
+            out = validate_ohlcv(bad, "TEST")
+        assert len(out) == len(ohlcv) - 1
+        assert "corrupta" in caplog.text
+
+    def test_widespread_bad_prices_raise(self, ohlcv):
+        bad = ohlcv.copy()
+        bad.iloc[:10, bad.columns.get_loc("close")] = -1.0   # 10 de 400 > 1%
         with pytest.raises(DataValidationError, match="precios <= 0"):
             validate_ohlcv(bad, "TEST")
 

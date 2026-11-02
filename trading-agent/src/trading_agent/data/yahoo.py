@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from ..exceptions import DataProviderError
+from ..exceptions import DataProviderError, RateLimitError
 from .provider import DataProvider, validate_ohlcv, with_retries
 
 logger = logging.getLogger(__name__)
@@ -45,10 +45,15 @@ def latest_period_for_interval(interval: str) -> str:
         >>> latest_period_for_interval("1m")
         '5d'
     """
+    # Velas necesarias ≈ 36 (calentamiento) + ventana (30) + margen.
+    # 5d de 1m ≈ 1950 velas; 5d de 5m ≈ 390; pero 5d de 30m son solo ~65:
+    # para 15m/30m se pide 1 mes (Yahoo permite hasta 60 días).
     if interval == "1d":
         return "1y"
     if interval in ("1h", "60m", "90m"):
         return "3mo"
+    if interval in ("15m", "30m"):
+        return "1mo"
     return "5d"
 
 
@@ -62,9 +67,11 @@ class YahooFinanceProvider(DataProvider):
             return None
         d = Path(self.config.cache_dir)
         d.mkdir(parents=True, exist_ok=True)
-        # La fecha en el nombre invalida el caché automáticamente cada día.
+        # La fecha en el nombre invalida el caché automáticamente cada día;
+        # lookback_days en el nombre evita reutilizar un histórico más corto.
         today = dt.date.today().isoformat()
-        return d / f"{symbol}_{self.config.interval}_{today}.parquet"
+        return d / (f"{symbol}_{self.config.interval}_"
+                    f"{self.config.lookback_days}d_{today}.parquet")
 
     def _download(self, symbol: str, *, period: str | None = None,
                   start: dt.datetime | None = None,
@@ -88,14 +95,23 @@ class YahooFinanceProvider(DataProvider):
 
         kwargs: dict = {"period": period} if period is not None \
             else {"start": start, "end": end}
-        raw = yf.download(
-            tickers=symbol,
-            interval=self.config.interval,
-            auto_adjust=True,     # precios ajustados por splits/dividendos
-            progress=False,
-            threads=False,
-            **kwargs,
-        )
+        try:
+            raw = yf.download(
+                tickers=symbol,
+                interval=self.config.interval,
+                auto_adjust=True,     # precios ajustados por splits/dividendos
+                progress=False,
+                threads=False,
+                **kwargs,
+            )
+        except Exception as exc:
+            # yfinance lanza YFRateLimitError al superar la cuota de Yahoo;
+            # insistir con backoff corto solo alarga el bloqueo.
+            if "ratelimit" in type(exc).__name__.lower():
+                raise RateLimitError(
+                    f"Yahoo Finance limitó la tasa para {symbol!r}: {exc}"
+                ) from exc
+            raise
         if raw is None or raw.empty:
             raise DataProviderError(f"yfinance devolvió vacío para {symbol!r}")
         # yfinance puede devolver columnas MultiIndex (precio, ticker).
@@ -108,8 +124,12 @@ class YahooFinanceProvider(DataProvider):
         reintentos). Ver contrato en :meth:`DataProvider.fetch_historical`."""
         cache = self._cache_path(symbol)
         if cache is not None and cache.exists():
-            logger.info("Cargando %s desde caché %s", symbol, cache)
-            return pd.read_parquet(cache)
+            try:
+                logger.info("Cargando %s desde caché %s", symbol, cache)
+                return validate_ohlcv(pd.read_parquet(cache), symbol)
+            except Exception as exc:  # noqa: BLE001 - caché corrupta: se vuelve a descargar
+                logger.warning("Caché %s ilegible (%s): se descarga de nuevo",
+                               cache, exc)
 
         end = dt.datetime.now(dt.timezone.utc)
         start = end - dt.timedelta(days=self.config.lookback_days)
@@ -120,7 +140,10 @@ class YahooFinanceProvider(DataProvider):
             what=f"histórico {symbol}",
         )
         if cache is not None:
-            df.to_parquet(cache)
+            # Escritura atómica: nunca queda un parquet a medias en disco.
+            tmp = cache.with_suffix(".tmp")
+            df.to_parquet(tmp)
+            tmp.replace(cache)
         logger.info("Histórico %s: %d velas [%s .. %s]", symbol, len(df),
                     df.index[0], df.index[-1])
         return df

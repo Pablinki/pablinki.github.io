@@ -56,6 +56,14 @@ class BloombergProvider(DataProvider):
         self._host = get_secret("BLOOMBERG_HOST")
         self._port = int(get_secret("BLOOMBERG_PORT"))
 
+    def _bbg_id(self, symbol: str) -> str:
+        """Identificador Bloomberg completo (``"AAPL US Equity"``).
+
+        Si el símbolo ya contiene un espacio se asume completo y se usa
+        tal cual; si no, se añade ``config.bloomberg_suffix``.
+        """
+        return symbol if " " in symbol else f"{symbol} {self.config.bloomberg_suffix}"
+
     # ------------------------------------------------------------------ #
     # Sesión                                                             #
     # ------------------------------------------------------------------ #
@@ -92,8 +100,8 @@ class BloombergProvider(DataProvider):
         try:
             service = session.getService("//blp/refdata")
             request = service.createRequest("HistoricalDataRequest")
-            # Convención Bloomberg: "AAPL US Equity".
-            request.getElement("securities").appendValue(f"{symbol} US Equity")
+            # Convención Bloomberg: "AAPL US Equity" (sufijo configurable).
+            request.getElement("securities").appendValue(self._bbg_id(symbol))
             for f in ("OPEN", "HIGH", "LOW", "PX_LAST", "VOLUME"):
                 request.getElement("fields").appendValue(f)
             request.set("startDate", start.strftime("%Y%m%d"))
@@ -139,7 +147,7 @@ class BloombergProvider(DataProvider):
         try:
             service = session.getService("//blp/refdata")
             request = service.createRequest("IntradayBarRequest")
-            request.set("security", f"{symbol} US Equity")
+            request.set("security", self._bbg_id(symbol))
             request.set("eventType", "TRADE")
             request.set("interval", minutes)
             request.set("startDateTime", start)
@@ -204,7 +212,10 @@ class BloombergProvider(DataProvider):
         ~400 días naturales; intradía, 5 días.
         """
         end = dt.datetime.now(dt.timezone.utc)
-        lookback_days = 400 if self.config.interval == "1d" else 5
+        # Días naturales que garantizan > 66 velas por intervalo (fines de
+        # semana y festivos incluidos).
+        lookback_days = {"1d": 400, "1h": 30, "30m": 15, "15m": 10}.get(
+            self.config.interval, 5)
         start = end - dt.timedelta(days=lookback_days)
 
         def _fetch() -> pd.DataFrame:

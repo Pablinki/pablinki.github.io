@@ -40,6 +40,12 @@ class DataProviderError(TradingAgentError):
     reintenta con backoff exponencial."""
 
 
+class RateLimitError(DataProviderError):
+    """El proveedor limitó la tasa de peticiones. No se reintenta de
+    inmediato (insistir empeora el bloqueo); el bucle en vivo espera al
+    siguiente ciclo de sondeo."""
+
+
 class DataValidationError(DataProviderError):
     """Los datos llegaron pero no pasan validación (NaN, precios <= 0,
     huecos temporales excesivos). No tiene sentido reintentar sin

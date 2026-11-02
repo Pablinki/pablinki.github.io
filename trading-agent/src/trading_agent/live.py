@@ -119,6 +119,7 @@ class LiveTrader:
         self._stop_event = threading.Event()
         self._last_bar_date = None      # arma el límite de pérdida diaria
         self._last_decided_bar = None   # el agente decide UNA vez por vela
+        self._last_price: float | None = None  # para liquidar sin red
 
     def _record(self, trade: Trade, *, reason: str, price: float) -> None:
         """Escribe una operación en el diario (si está activo)."""
@@ -270,6 +271,7 @@ class LiveTrader:
         feats = feats_df.loc[:, list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
         bar_ts = feats_df.index[-1]
         price = float(latest["close"].iloc[-1])
+        self._last_price = price
         tag = bar_ts.isoformat()  # id idempotente de las órdenes de esta vela
 
         equity = self.portfolio.equity({self.symbol: price})
@@ -425,8 +427,14 @@ class LiveTrader:
         if not self.portfolio.has_position(self.symbol):
             return
         try:
-            latest = self.provider.fetch_latest(self.symbol)
-            price = float(latest["close"].iloc[-1])
+            # Con un broker real la orden market usa el precio de mercado;
+            # el último precio conocido basta y evita depender de la red
+            # (y de sus reintentos) justo cuando hay prisa por parar.
+            if self._last_price is not None:
+                price = self._last_price
+            else:
+                latest = self.provider.fetch_latest(self.symbol)
+                price = float(latest["close"].iloc[-1])
             if not self.broker.is_market_open():
                 logger.error("Mercado cerrado: no se puede liquidar %s ahora. "
                              "La posición sigue abierta en el broker; "

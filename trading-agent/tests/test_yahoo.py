@@ -47,6 +47,39 @@ class TestLatestPeriod:
     def test_hourly_needs_months(self):
         assert latest_period_for_interval("1h") == "3mo"
 
-    @pytest.mark.parametrize("interval", ["1m", "5m", "15m", "30m"])
-    def test_minutes_use_five_days(self, interval):
+    @pytest.mark.parametrize("interval", ["15m", "30m"])
+    def test_quarter_and_half_hour_need_a_month(self, interval):
+        # 5 días de velas de 30m son ~65: no cubren 36 de calentamiento + 30.
+        assert latest_period_for_interval(interval) == "1mo"
+
+    @pytest.mark.parametrize("interval", ["1m", "5m"])
+    def test_fine_minutes_use_five_days(self, interval):
         assert latest_period_for_interval(interval) == "5d"
+
+
+class TestRateLimit:
+    def test_rate_limit_is_typed_and_not_retried(self, monkeypatch, tmp_path):
+        """YFRateLimitError -> RateLimitError sin reintentos con backoff."""
+        import sys
+        import types
+
+        from trading_agent.config import DataConfig
+        from trading_agent.data.yahoo import YahooFinanceProvider
+        from trading_agent.exceptions import RateLimitError
+
+        class YFRateLimitError(Exception):
+            pass
+
+        calls = {"n": 0}
+
+        def fake_download(**kwargs):
+            calls["n"] += 1
+            raise YFRateLimitError("Too Many Requests")
+
+        fake_yf = types.SimpleNamespace(download=fake_download)
+        monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+        provider = YahooFinanceProvider(DataConfig(cache_dir=None, max_retries=3,
+                                                   retry_backoff_s=0.0))
+        with pytest.raises(RateLimitError):
+            provider.fetch_latest("AAPL")
+        assert calls["n"] == 1  # ni un reintento

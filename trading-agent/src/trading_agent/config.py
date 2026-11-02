@@ -46,6 +46,13 @@ from .exceptions import ConfigurationError
 #: Caracteres permitidos en un ticker (evita rutas o parámetros inyectados).
 SYMBOL_PATTERN = re.compile(r"[A-Z0-9^][A-Z0-9.\-=^]{0,14}")
 
+#: Intervalos de vela soportados por todo el sistema (datos, features, vivo).
+SUPPORTED_INTERVALS = ("1m", "5m", "15m", "30m", "1h", "1d")
+
+#: Máximo de días de histórico que Yahoo Finance sirve por intervalo
+#: intradía (los diarios no tienen límite práctico).
+YAHOO_MAX_LOOKBACK_DAYS = {"1m": 7, "5m": 60, "15m": 60, "30m": 60, "1h": 730}
+
 
 def _require(condition: bool, message: str) -> None:
     """Valida una condición de configuración.
@@ -76,6 +83,9 @@ class DataConfig:
             (espera real = ``retry_backoff_s * 2**intento``).
         cache_dir: directorio donde se cachean descargas (evita golpear
             la API en cada corrida). ``None`` desactiva el caché.
+        bloomberg_suffix: sufijo de identificador Bloomberg que se añade
+            al ticker (``"AAPL"`` -> ``"AAPL US Equity"``). Cámbialo para
+            otros mercados (p. ej. ``"MM Equity"`` para México).
     """
 
     provider: str = "yahoo"
@@ -85,6 +95,7 @@ class DataConfig:
     max_retries: int = 3
     retry_backoff_s: float = 1.0
     cache_dir: str | None = ".cache/market_data"
+    bloomberg_suffix: str = "US Equity"
 
     def __post_init__(self) -> None:
         _require(self.provider in ("yahoo", "bloomberg"),
@@ -96,7 +107,16 @@ class DataConfig:
             _require(bool(SYMBOL_PATTERN.fullmatch(s)),
                      f"Símbolo inválido {s!r}: use solo A-Z, 0-9, '.', '-', "
                      "'=' o '^' (máx. 15 caracteres)")
+        _require(self.interval in SUPPORTED_INTERVALS,
+                 f"interval debe ser uno de {SUPPORTED_INTERVALS}, no "
+                 f"{self.interval!r}")
         _require(self.lookback_days > 0, "lookback_days debe ser > 0")
+        if self.provider == "yahoo" and self.interval in YAHOO_MAX_LOOKBACK_DAYS:
+            limit = YAHOO_MAX_LOOKBACK_DAYS[self.interval]
+            _require(self.lookback_days <= limit,
+                     f"Yahoo Finance solo sirve {limit} días de velas de "
+                     f"{self.interval}; lookback_days={self.lookback_days} "
+                     "sería rechazado (ajústalo o usa interval: 1d)")
         _require(self.max_retries >= 0, "max_retries debe ser >= 0")
         _require(self.retry_backoff_s >= 0, "retry_backoff_s debe ser >= 0")
 

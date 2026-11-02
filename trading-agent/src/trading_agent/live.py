@@ -35,6 +35,7 @@ from types import FrameType
 import numpy as np
 
 from .agent.dqn import DQNAgent
+from .brokers import BrokerAdapter, PaperBroker, make_broker
 from .config import AppConfig
 from .data.provider import DataProvider, make_provider
 from .env import Action
@@ -60,24 +61,32 @@ class LiveTrader:
     """
 
     def __init__(self, config: AppConfig, agent: DQNAgent,
-                 provider: DataProvider | None = None) -> None:
+                 provider: DataProvider | None = None,
+                 broker: BrokerAdapter | None = None) -> None:
         """
         Args:
             config: configuración de la aplicación.
             agent: agente DQN con checkpoint cargado (``agent.load``).
             provider: proveedor de datos; si es ``None`` se construye
                 desde la config (inyectable para tests).
+            broker: ejecutor de órdenes; si es ``None`` se usa
+                :class:`~trading_agent.brokers.PaperBroker` (simulado)
+                sobre un portafolio con los costes de la config. Un broker
+                real (p. ej. Alpaca) trae su propio portafolio espejo.
         """
         self.config = config
         self.agent = agent
         self.provider = provider or make_provider(config.data)
         self.symbol = config.data.symbols[0]
         self.risk = RiskManager(config.risk)
-        self.portfolio = Portfolio(
-            cash=config.env.initial_cash,
-            commission_pct=config.env.commission_pct,
-            slippage_pct=config.env.slippage_pct,
-        )
+        if broker is None:
+            broker = PaperBroker(Portfolio(
+                cash=config.env.initial_cash,
+                commission_pct=config.env.commission_pct,
+                slippage_pct=config.env.slippage_pct,
+            ))
+        self.broker = broker
+        self.portfolio = broker.portfolio  # contabilidad compartida
         self._stop_requested = False
         self._last_bar_date = None  # arma el límite de pérdida diaria
 
@@ -155,7 +164,7 @@ class LiveTrader:
             reason = self.risk.should_force_close(
                 self.portfolio.positions[self.symbol], price)
             if reason is not None:
-                trade = self.portfolio.close_position(self.symbol, price)
+                trade = self.broker.close_position(self.symbol, price)
                 forced_close = reason
                 logger.warning("%s: cierre forzoso por %s, P&L %.2f USD",
                                self.symbol, reason, trade.pnl)
@@ -172,10 +181,10 @@ class LiveTrader:
                     * (1.0 + self.config.env.commission_pct))
                 qty = min(qty, float(int(max_affordable)))
                 if qty > 0:
-                    self.portfolio.open_position(self.symbol, price, qty)
+                    self.broker.open_position(self.symbol, qty, price)
                     logger.info("%s: COMPRA %g @ %.2f", self.symbol, qty, price)
         elif action == Action.SELL and self.portfolio.has_position(self.symbol):
-            trade = self.portfolio.close_position(self.symbol, price)
+            trade = self.broker.close_position(self.symbol, price)
             logger.info("%s: VENTA %g @ %.2f, P&L %.2f USD",
                         self.symbol, trade.quantity, price, trade.pnl)
 
@@ -240,19 +249,24 @@ class LiveTrader:
         try:
             latest = self.provider.fetch_latest(self.symbol)
             price = float(latest["close"].iloc[-1])
-            trade = self.portfolio.close_position(self.symbol, price)
+            trade = self.broker.close_position(self.symbol, price)
             logger.info("Liquidación final: %s P&L %.2f USD", self.symbol, trade.pnl)
         except TradingAgentError as exc:
             logger.error("No se pudo liquidar %s automáticamente: %s. "
                          "REVISAR MANUALMENTE.", self.symbol, exc)
 
 
-def build_live_trader(config: AppConfig, checkpoint_path: str) -> LiveTrader:
+def build_live_trader(config: AppConfig, checkpoint_path: str,
+                      broker_name: str = "paper") -> LiveTrader:
     """Construye un :class:`LiveTrader` con el checkpoint indicado.
 
     Args:
         config: configuración de la aplicación.
         checkpoint_path: ruta del modelo entrenado (``.pt``).
+        broker_name: ``"paper"`` (simulado, defecto) o ``"alpaca"``.
+            Con un broker real, el portafolio espejo se crea sin costes
+            simulados (los costes reales vienen en cada fill) y su
+            efectivo se sincroniza con el de la cuenta del broker.
 
     Returns:
         ``LiveTrader`` listo para :meth:`LiveTrader.run_forever`.
@@ -266,4 +280,15 @@ def build_live_trader(config: AppConfig, checkpoint_path: str) -> LiveTrader:
     agent_cfg = dataclasses.replace(config.agent, state_dim=state_dim)
     agent = DQNAgent(agent_cfg)
     agent.load(checkpoint_path)
-    return LiveTrader(config, agent)
+
+    if broker_name == "paper":
+        broker = None  # LiveTrader crea el PaperBroker con la config
+    else:
+        # Broker real: portafolio espejo sin costes simulados.
+        broker = make_broker(broker_name, Portfolio(
+            cash=config.env.initial_cash, commission_pct=0.0,
+            slippage_pct=0.0))
+        sync = getattr(broker, "sync_cash", None)
+        if callable(sync):
+            sync()
+    return LiveTrader(config, agent, broker=broker)

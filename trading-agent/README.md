@@ -244,6 +244,33 @@ Políticas aplicadas:
 
 ---
 
+## Broker real (Alpaca)
+
+El bucle en vivo ejecuta las órdenes a través de la interfaz
+`BrokerAdapter` (`src/trading_agent/brokers/`). Por defecto usa
+`PaperBroker` (simulación local). Para ejecutar órdenes reales de mercado
+está incluido el adaptador de **Alpaca Markets**:
+
+```bash
+export ALPACA_API_KEY="tu-clave"
+export ALPACA_SECRET_KEY="tu-secreto"
+# Sin ALPACA_BASE_URL se usa el PAPER de Alpaca (dinero ficticio):
+python scripts/run_live.py --broker alpaca --checkpoint checkpoints/dqn_best.pt
+```
+
+Flujo de cada orden: orden *market* → sondeo hasta el *fill* (con timeout
+y cancelación best-effort) → el precio real de ejecución se refleja en el
+portafolio espejo local, que es el que ven el RiskManager y el estado del
+agente. El efectivo se sincroniza con la cuenta al arrancar.
+
+Escalera de despliegue recomendada: (1) `--broker paper` semanas,
+(2) `--broker alpaca` contra el paper de Alpaca (misma API que la real),
+(3) solo entonces, dinero real: exportar `TRADING_AGENT_LIVE=YES` **y**
+`ALPACA_BASE_URL=https://api.alpaca.markets`. Sin ambas cosas, el
+adaptador rechaza arrancar en live (`SecurityError`). Ten presente la
+regla *Pattern Day Trader* de EE. UU. (25.000 USD mínimos para >3
+day-trades en 5 días hábiles) si usas intervalos intradía.
+
 ## Escalabilidad
 
 - **Proveedores intercambiables** (patrón Strategy + Factory): añadir IEX,

@@ -41,6 +41,12 @@ def main() -> int:
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     parser.add_argument("--max-iterations", type=int, default=0,
                         help="0 = sin límite")
+    parser.add_argument("--broker", default="paper",
+                        choices=["paper", "alpaca"],
+                        help="Ejecutor de órdenes: 'paper' simula en local; "
+                             "'alpaca' usa la API de Alpaca (paper de Alpaca "
+                             "por defecto; dinero real solo con "
+                             "TRADING_AGENT_LIVE=YES y ALPACA_BASE_URL live)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -49,7 +55,8 @@ def main() -> int:
 
     try:
         config = load_config(args.config)
-        trader = build_live_trader(config, args.checkpoint)
+        trader = build_live_trader(config, args.checkpoint,
+                                   broker_name=args.broker)
         trader.run_forever(
             poll_seconds=args.poll_seconds,
             max_iterations=args.max_iterations or None)

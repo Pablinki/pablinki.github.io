@@ -9,6 +9,7 @@ import pytest
 from conftest import make_ohlcv
 
 from trading_agent.agent.dqn import DQNAgent
+from trading_agent.brokers.base import PaperBroker
 from trading_agent.config import (
     AgentConfig,
     AppConfig,
@@ -71,6 +72,19 @@ class TestRunOnce:
     def test_data_failure_propagates_for_caller_to_handle(self):
         with pytest.raises(DataProviderError):
             make_trader(fail_data=True).run_once()
+
+    def test_injected_broker_shares_portfolio_accounting(self):
+        """LiveTrader y el broker inyectado deben compartir el mismo
+        Portfolio: la contabilidad que ve el riesgo es la del broker."""
+        from trading_agent.portfolio import Portfolio
+
+        broker = PaperBroker(Portfolio(cash=12_345.0))
+        trader = make_trader()
+        trader_with_broker = LiveTrader(trader.config, trader.agent,
+                                        provider=trader.provider,
+                                        broker=broker)
+        assert trader_with_broker.portfolio is broker.portfolio
+        assert trader_with_broker.portfolio.cash == pytest.approx(12_345.0)
 
     def test_daily_loss_limit_gets_armed(self):
         """run_once debe armar el límite de pérdida diaria con la fecha de

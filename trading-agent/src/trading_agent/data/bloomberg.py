@@ -44,7 +44,7 @@ class BloombergProvider(DataProvider):
     conexiones de la Terminal).
     """
 
-    def __init__(self, config) -> None:  # noqa: ANN001 - DataConfig
+    def __init__(self, config) -> None:
         super().__init__(config)
         try:
             import blpapi  # noqa: F401
@@ -59,7 +59,7 @@ class BloombergProvider(DataProvider):
     # ------------------------------------------------------------------ #
     # Sesión                                                             #
     # ------------------------------------------------------------------ #
-    def _open_session(self):  # noqa: ANN202 - blpapi.Session
+    def _open_session(self):
         """Abre y arranca una sesión blpapi contra ``//blp/refdata``.
 
         Returns:

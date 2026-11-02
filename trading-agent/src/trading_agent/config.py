@@ -227,12 +227,12 @@ class AppConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
 
     @staticmethod
-    def default() -> "AppConfig":
+    def default() -> AppConfig:
         """Devuelve una configuración por defecto lista para usar."""
         return AppConfig()
 
     @staticmethod
-    def from_dict(raw: dict[str, Any]) -> "AppConfig":
+    def from_dict(raw: dict[str, Any]) -> AppConfig:
         """Construye la configuración desde un ``dict`` anidado (p. ej. YAML).
 
         Args:

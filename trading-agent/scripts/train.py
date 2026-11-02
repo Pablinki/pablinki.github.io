@@ -26,9 +26,9 @@ from pathlib import Path
 # Permite ejecutar el script sin instalar el paquete (modo desarrollo).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from trading_agent.config import load_config          # noqa: E402
-from trading_agent.exceptions import TradingAgentError  # noqa: E402
-from trading_agent.train import train                  # noqa: E402
+from trading_agent.config import load_config
+from trading_agent.exceptions import TradingAgentError
+from trading_agent.train import train
 
 
 def main() -> int:
@@ -50,10 +50,11 @@ def main() -> int:
         config = load_config(args.config)
         metrics = train(config, episodes=args.episodes,
                         checkpoint_path=args.checkpoint)
-        logging.info("Métricas finales: %s", metrics)
+        logging.getLogger(__name__).info("Métricas finales: %s", metrics)
         return 0
     except TradingAgentError as exc:
-        logging.error("El entrenamiento falló de forma controlada: %s", exc)
+        logging.getLogger(__name__).error(
+            "El entrenamiento falló de forma controlada: %s", exc)
         return 1
 
 

@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from trading_agent.config import (AgentConfig, AppConfig, DataConfig,
-                                  EnvConfig, RiskConfig)
+from trading_agent.config import (
+    AgentConfig,
+    AppConfig,
+    DataConfig,
+    EnvConfig,
+    RiskConfig,
+)
 from trading_agent.exceptions import TradingAgentError
 from trading_agent.train import time_split, train
 

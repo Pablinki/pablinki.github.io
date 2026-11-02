@@ -38,8 +38,7 @@ from .agent.dqn import DQNAgent
 from .config import AppConfig
 from .data.provider import DataProvider, make_provider
 from .env import Action
-from .exceptions import (DataProviderError, ExecutionError,
-                         TradingAgentError)
+from .exceptions import DataProviderError, ExecutionError, TradingAgentError
 from .features import FEATURE_COLUMNS, build_features
 from .portfolio import Portfolio
 from .risk import RiskManager
@@ -80,6 +79,7 @@ class LiveTrader:
             slippage_pct=config.env.slippage_pct,
         )
         self._stop_requested = False
+        self._last_bar_date = None  # arma el límite de pérdida diaria
 
     # ------------------------------------------------------------------ #
     # Señales del sistema (Ctrl+C / SIGTERM del orquestador)             #
@@ -141,6 +141,13 @@ class LiveTrader:
 
         equity = self.portfolio.equity({self.symbol: price})
         self.risk.update_equity(equity)
+
+        # Nueva jornada (fecha de la última vela): arma el límite de
+        # pérdida diaria con el equity de apertura del día.
+        bar_date = feats_df.index[-1].date()
+        if bar_date != self._last_bar_date:
+            self.risk.start_new_day(equity)
+            self._last_bar_date = bar_date
 
         # (3) Gestión de riesgo primero: los stops mandan sobre el agente.
         forced_close = None

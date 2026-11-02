@@ -4,4 +4,4 @@ from .dqn import DQNAgent
 from .networks import QNetwork
 from .replay_buffer import Batch, ReplayBuffer
 
-__all__ = ["DQNAgent", "QNetwork", "ReplayBuffer", "Batch"]
+__all__ = ["Batch", "DQNAgent", "QNetwork", "ReplayBuffer"]

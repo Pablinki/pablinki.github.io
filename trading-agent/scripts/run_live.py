@@ -12,10 +12,14 @@ Entradas:
     --poll-seconds: segundos entre decisiones.
     --max-iterations: tope de iteraciones (0 = infinito).
 
-Seguridad:
-    Este script SIEMPRE opera en modo paper (simulado). Conectar un broker
-    real exige además exportar TRADING_AGENT_LIVE=YES y escribir el
-    adaptador de ejecución correspondiente.
+Seguridad (tres niveles):
+    1. ``--broker paper`` (defecto): simulación local, sin broker.
+    2. ``--broker alpaca``: órdenes reales contra el entorno PAPER de
+       Alpaca (dinero ficticio) salvo que se cambie ALPACA_BASE_URL.
+    3. Dinero real: además de ALPACA_BASE_URL=https://api.alpaca.markets
+       exige TRADING_AGENT_LIVE=YES; sin ambas, el arranque falla.
+    El estado de riesgo (pico de equity, kill-switch) persiste en
+    ``--risk-state`` para que un reinicio no lo rearme solo.
 """
 
 from __future__ import annotations
@@ -50,6 +54,9 @@ def main() -> int:
     parser.add_argument("--journal", default="logs/trades.csv",
                         help="Diario CSV de operaciones (cadena vacía para "
                              "desactivarlo)")
+    parser.add_argument("--risk-state", default="logs/risk_state.json",
+                        help="Estado persistente del gestor de riesgo "
+                             "(cadena vacía = solo memoria)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -60,7 +67,8 @@ def main() -> int:
         config = load_config(args.config)
         trader = build_live_trader(config, args.checkpoint,
                                    broker_name=args.broker,
-                                   journal_path=args.journal or None)
+                                   journal_path=args.journal or None,
+                                   risk_state_path=args.risk_state or None)
         trader.run_forever(
             poll_seconds=args.poll_seconds,
             max_iterations=args.max_iterations or None)

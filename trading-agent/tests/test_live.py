@@ -265,6 +265,50 @@ class TestProductionGuards:
         trader.run_forever(poll_seconds=30.0, max_iterations=5)
         assert time.monotonic() - start < 5.0
 
+    def test_risk_state_persists_and_blocks_restart_when_halted(self, tmp_path):
+        """El estado de riesgo sobrevive al proceso; un kill-switch activo
+        impide rearrancar hasta intervención humana."""
+        import json
+
+        from trading_agent.env import Action
+
+        path = tmp_path / "risk_state.json"
+        trader = make_forced_trader(Action.HOLD, risk_state_path=path)
+        trader.run_once()
+        state = json.loads(path.read_text())
+        assert state["peak_equity"] == pytest.approx(100_000.0)
+        assert state["halted"] is False
+        # Simular que el proceso paró por drawdown...
+        path.write_text(json.dumps({**state, "halted": True}))
+        with pytest.raises(TradingAgentError, match="Kill-switch"):
+            make_forced_trader(Action.HOLD, risk_state_path=path)
+
+    def test_daily_reconciliation_adopts_broker_view(self, caplog):
+        """Al cambiar de jornada, el espejo se re-sincroniza con el broker y
+        una divergencia se registra como CRITICAL."""
+        from trading_agent.env import Action
+        from trading_agent.portfolio import Portfolio
+
+        class SyncingBroker(PaperBroker):
+            def __init__(self, portfolio):
+                super().__init__(portfolio)
+                self.syncs = 0
+
+            def sync(self):
+                self.syncs += 1
+                self.portfolio.cash = 42_000.0  # la "cuenta" dice otra cosa
+
+        broker = SyncingBroker(Portfolio(cash=100_000.0))
+        trader = make_forced_trader(Action.HOLD, broker=broker)
+        trader.run_once()                 # primera jornada: sin reconciliar
+        assert broker.syncs == 0
+        trader._last_bar_date = None      # fuerza "nueva jornada"
+        with caplog.at_level("CRITICAL"):
+            trader.run_once()
+        assert broker.syncs == 1
+        assert "DIVERGENCIA" in caplog.text
+        assert trader.portfolio.cash == pytest.approx(42_000.0)
+
     def test_invalid_max_consecutive_errors_raises(self):
         from trading_agent.env import Action
 

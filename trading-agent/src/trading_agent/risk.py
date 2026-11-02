@@ -56,6 +56,7 @@ class RiskManager:
         self.peak_equity: float | None = None
         self.day_start_equity: float | None = None
         self.halted = False
+        self.cooldown_remaining = 0  # velas sin abrir tras un cierre forzoso
 
     # ------------------------------------------------------------------ #
     # Ciclo de vida                                                      #
@@ -65,6 +66,48 @@ class RiskManager:
         self.peak_equity = None
         self.day_start_equity = None
         self.halted = False
+        self.cooldown_remaining = 0
+
+    def to_dict(self) -> dict[str, object]:
+        """Estado serializable (para sobrevivir a reinicios del proceso).
+
+        Returns:
+            Dict con ``peak_equity``, ``day_start_equity``, ``halted`` y
+            ``cooldown_remaining``.
+        """
+        return {
+            "peak_equity": self.peak_equity,
+            "day_start_equity": self.day_start_equity,
+            "halted": self.halted,
+            "cooldown_remaining": self.cooldown_remaining,
+        }
+
+    def load_dict(self, state: dict[str, object]) -> None:
+        """Restaura el estado guardado con :meth:`to_dict`.
+
+        Un reinicio NO debe rearmar el kill-switch ni olvidar el pico de
+        equity: si el proceso paró por drawdown, sigue parado hasta que un
+        humano borre o edite el archivo de estado.
+
+        Args:
+            state: dict producido por :meth:`to_dict` (claves faltantes
+                conservan el valor actual).
+        """
+        if state.get("peak_equity") is not None:
+            self.peak_equity = float(state["peak_equity"])  # type: ignore[arg-type]
+        if state.get("day_start_equity") is not None:
+            self.day_start_equity = float(state["day_start_equity"])  # type: ignore[arg-type]
+        self.halted = bool(state.get("halted", self.halted))
+        self.cooldown_remaining = int(state.get("cooldown_remaining", 0))  # type: ignore[arg-type]
+
+    def new_bar(self) -> None:
+        """Avanza una vela: consume el enfriamiento tras un cierre forzoso."""
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+
+    def on_forced_close(self) -> None:
+        """Registra un cierre forzoso y arma el enfriamiento configurado."""
+        self.cooldown_remaining = self.config.cooldown_bars
 
     def start_new_day(self, equity: float) -> None:
         """Marca el inicio de una jornada para el límite de pérdida diaria.
@@ -106,6 +149,11 @@ class RiskManager:
             día supera ``max_daily_loss_pct``; ``True`` en caso contrario.
         """
         if self.halted:
+            logger.warning("Kill-switch activo: no se abren posiciones")
+            return False
+        if self.cooldown_remaining > 0:
+            logger.info("Enfriamiento tras cierre forzoso: %d velas restantes",
+                        self.cooldown_remaining)
             return False
         if self.day_start_equity is not None:
             daily_loss = 1.0 - equity / self.day_start_equity
@@ -136,6 +184,42 @@ class RiskManager:
             return 0.0
         budget = equity * self.config.max_position_pct
         return float(math.floor(budget / price))
+
+    def evaluate_bar(self, position: Position, open_: float, high: float,
+                     low: float, close: float) -> tuple[str | None, float]:
+        """Evalúa stop-loss/take-profit contra el rango COMPLETO de una vela.
+
+        Un stop no se dispara solo al cierre: en vivo se evalúa con cada
+        precio, así que el backtest debe ver los mínimos/máximos intrabarra.
+        Precio de ejecución: el nivel del stop, salvo que la vela abra ya
+        más allá (hueco), en cuyo caso se ejecuta a la apertura — peor
+        para el operador, como en la realidad.
+
+        Args:
+            position: posición abierta.
+            open_: apertura de la vela.
+            high: máximo de la vela.
+            low: mínimo de la vela.
+            close: cierre de la vela.
+
+        Returns:
+            Tupla ``(motivo, precio_de_ejecución)``; ``motivo`` es
+            ``"stop_loss"``, ``"take_profit"`` o ``None`` (y entonces el
+            precio es ``close``). Si ambos niveles caen dentro de la misma
+            vela, prevalece el stop-loss (supuesto conservador).
+        """
+        stop_price = position.entry_price * (1.0 - self.config.stop_loss_pct)
+        if open_ <= stop_price:
+            return "stop_loss", open_
+        if low <= stop_price:
+            return "stop_loss", stop_price
+        if self.config.take_profit_pct is not None:
+            tp_price = position.entry_price * (1.0 + self.config.take_profit_pct)
+            if open_ >= tp_price:
+                return "take_profit", open_
+            if high >= tp_price:
+                return "take_profit", tp_price
+        return None, close
 
     def should_force_close(self, position: Position, price: float) -> str | None:
         """Evalúa stop-loss y take-profit sobre una posición abierta.

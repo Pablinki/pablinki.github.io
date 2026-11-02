@@ -10,6 +10,10 @@ on:
   pull_request:
     paths: ["trading-agent/**", ".github/workflows/trading-agent-tests.yml"]
 
+# Mínimo privilegio: el job solo necesita leer el repositorio.
+permissions:
+  contents: read
+
 jobs:
   tests:
     runs-on: ubuntu-latest

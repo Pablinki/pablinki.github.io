@@ -36,11 +36,15 @@ Ejemplo
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .exceptions import ConfigurationError
+
+#: Caracteres permitidos en un ticker (evita rutas o parámetros inyectados).
+SYMBOL_PATTERN = re.compile(r"[A-Z0-9^][A-Z0-9.\-=^]{0,14}")
 
 
 def _require(condition: bool, message: str) -> None:
@@ -86,6 +90,12 @@ class DataConfig:
         _require(self.provider in ("yahoo", "bloomberg"),
                  f"provider debe ser 'yahoo' o 'bloomberg', no {self.provider!r}")
         _require(len(self.symbols) > 0, "symbols no puede estar vacío")
+        # Los símbolos acaban en nombres de archivo (caché) y en peticiones
+        # HTTP: solo caracteres de ticker (AAPL, BRK-B, BTC-USD, ^GSPC, ES=F).
+        for s in self.symbols:
+            _require(bool(SYMBOL_PATTERN.fullmatch(s)),
+                     f"Símbolo inválido {s!r}: use solo A-Z, 0-9, '.', '-', "
+                     "'=' o '^' (máx. 15 caracteres)")
         _require(self.lookback_days > 0, "lookback_days debe ser > 0")
         _require(self.max_retries >= 0, "max_retries debe ser >= 0")
         _require(self.retry_backoff_s >= 0, "retry_backoff_s debe ser >= 0")
@@ -199,6 +209,10 @@ class RiskConfig:
             automático (``None`` la desactiva).
         max_daily_loss_pct: pérdida diaria máxima del equity; al superarse
             no se abren posiciones nuevas ese día.
+        cooldown_bars: nº de velas tras un cierre forzoso (stop-loss /
+            take-profit) durante las cuales no se abre posición nueva
+            (0 = sin enfriamiento). Evita reentrar al mismo precio justo
+            después de un stop. Se aplica igual en backtest y en vivo.
     """
 
     max_position_pct: float = 0.25
@@ -206,6 +220,7 @@ class RiskConfig:
     stop_loss_pct: float = 0.05
     take_profit_pct: float | None = 0.10
     max_daily_loss_pct: float = 0.03
+    cooldown_bars: int = 0
 
     def __post_init__(self) -> None:
         _require(0 < self.max_position_pct <= 1, "max_position_pct debe estar en (0, 1]")
@@ -215,6 +230,7 @@ class RiskConfig:
                  "take_profit_pct debe ser > 0 o None")
         _require(0 < self.max_daily_loss_pct <= 1,
                  "max_daily_loss_pct debe estar en (0, 1]")
+        _require(self.cooldown_bars >= 0, "cooldown_bars debe ser >= 0")
 
 
 @dataclass(frozen=True)

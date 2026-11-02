@@ -130,8 +130,14 @@ class TradingEnvironment:
         else:
             self._features = features.loc[features.index.isin(ohlcv.index),
                                           list(FEATURE_COLUMNS)]
-        # Precio de cierre alineado con las filas de features supervivientes.
-        self._prices = ohlcv.loc[self._features.index, "close"].to_numpy()
+        # OHLC alineado con las filas de features supervivientes. Los stops
+        # se evalúan contra el rango completo de la vela (open/high/low),
+        # no solo contra el cierre: en vivo se disparan con cualquier precio.
+        aligned = ohlcv.loc[self._features.index]
+        self._prices = aligned["close"].to_numpy()
+        self._opens = aligned["open"].to_numpy()
+        self._highs = aligned["high"].to_numpy()
+        self._lows = aligned["low"].to_numpy()
         self._feat_matrix = self._features.to_numpy(dtype=np.float32)
         # Fechas de calendario por vela: arman el límite de pérdida diaria.
         self._dates = self._features.index.date
@@ -226,13 +232,20 @@ class TradingEnvironment:
             # es un día y el límite actúa como tope de pérdida por vela).
             self.risk.start_new_day(equity_before)
 
-        # (3) Cierres forzosos por gestión de riesgo.
+        # (3) Cierres forzosos por gestión de riesgo, evaluados INTRABARRA:
+        # si el mínimo/máximo de la vela cruza el stop/take-profit, se
+        # ejecuta al nivel del stop (o a la apertura si la vela abre con
+        # hueco más allá), igual que ocurriría en vivo.
+        self.risk.new_bar()
         forced_close = None
         if self._portfolio.has_position(self.symbol):
-            reason = self.risk.should_force_close(
-                self._portfolio.positions[self.symbol], new_price)
+            reason, fill_price = self.risk.evaluate_bar(
+                self._portfolio.positions[self.symbol],
+                float(self._opens[self._t]), float(self._highs[self._t]),
+                float(self._lows[self._t]), new_price)
             if reason is not None:
-                self._portfolio.close_position(self.symbol, new_price)
+                self._portfolio.close_position(self.symbol, fill_price)
+                self.risk.on_forced_close()
                 forced_close = reason
 
         # (4) Fin de episodio y liquidación ANTES de calcular la recompensa:

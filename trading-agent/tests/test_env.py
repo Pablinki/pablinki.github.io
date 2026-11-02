@@ -174,6 +174,43 @@ class TestRiskIntegration:
                 closes.append(info["forced_close"])
         assert "stop_loss" in closes
 
+    def test_stop_is_evaluated_intrabar_and_fills_at_stop_level(self, small_ohlcv):
+        """Si el mínimo de la vela cruza el stop, se cierra al nivel del
+        stop aunque el cierre haya recuperado (antes solo miraba el cierre)."""
+        df = small_ohlcv.copy()
+        env = TradingEnvironment(
+            df, EnvConfig(window_size=10, commission_pct=0.0, slippage_pct=0.0),
+            RiskConfig(stop_loss_pct=0.05, take_profit_pct=None), symbol="TEST")
+        env.reset()
+        env.step(Action.BUY)
+        entry = env._portfolio.positions["TEST"].entry_price
+        # Forzar en la vela siguiente un mínimo por debajo del stop con
+        # cierre por encima: debe dispararse y ejecutar al nivel del stop.
+        t = env._t + 1
+        env._lows[t] = entry * 0.90
+        env._opens[t] = entry * 0.99
+        env._prices[t] = entry * 0.99
+        _, _, _, info = env.step(Action.HOLD)
+        assert info["forced_close"] == "stop_loss"
+        sell = env._portfolio.trades[-1]
+        assert sell.price == pytest.approx(entry * 0.95)
+
+    def test_cooldown_blocks_reentry_after_stop(self, small_ohlcv):
+        env = TradingEnvironment(
+            small_ohlcv, EnvConfig(window_size=10),
+            RiskConfig(stop_loss_pct=0.0001, take_profit_pct=None,
+                       cooldown_bars=3), symbol="TEST")
+        env.reset()
+        env.step(Action.BUY)
+        done = False
+        while not done:
+            _, _, done, info = env.step(Action.HOLD)
+            if info["forced_close"]:
+                break
+        assert env.risk.cooldown_remaining == 3
+        _, _, _, info = env.step(Action.BUY)   # vetada por enfriamiento
+        assert not info["has_position"]
+
     def test_daily_loss_limit_is_armed(self, small_ohlcv):
         """El límite de pérdida diaria debe armarse en reset y rearmarse al
         cambiar el día de calendario (antes era código muerto)."""

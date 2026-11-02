@@ -67,6 +67,7 @@ class Position:
     symbol: str
     quantity: float
     entry_price: float
+    entry_commission: float = 0.0  # se descuenta del P&L realizado al cerrar
 
     def unrealized_pnl(self, price: float) -> float:
         """P&L no realizado a un precio de mercado dado.
@@ -140,7 +141,8 @@ class Portfolio:
     # ------------------------------------------------------------------ #
     # Operaciones                                                        #
     # ------------------------------------------------------------------ #
-    def open_position(self, symbol: str, price: float, quantity: float) -> Trade:
+    def open_position(self, symbol: str, price: float, quantity: float, *,
+                      enforce_funds: bool = True) -> Trade:
         """Abre una posición larga comprando ``quantity`` acciones.
 
         Aplica slippage adverso (compra a ``price * (1 + slippage_pct)``)
@@ -150,6 +152,10 @@ class Portfolio:
             symbol: ticker a comprar.
             price: precio de mercado de referencia (> 0).
             quantity: nº de acciones (> 0).
+            enforce_funds: si ``True`` (simulación) rechaza compras que no
+                caben en el efectivo. Un broker real lo pone en ``False``:
+                el fill ya ocurrió y el espejo debe reflejarlo aunque el
+                efectivo local quede desfasado (se re-sincroniza después).
 
         Returns:
             El :class:`Trade` de compra registrado.
@@ -158,7 +164,8 @@ class Portfolio:
             ExecutionError: si ya hay posición abierta en ``symbol`` (este
                 modelo mantiene como máximo una posición por símbolo) o si
                 los argumentos son inválidos.
-            InsufficientFundsError: si el coste total supera el efectivo.
+            InsufficientFundsError: si el coste total supera el efectivo
+                (solo con ``enforce_funds=True``).
         """
         if price <= 0 or quantity <= 0:
             raise ExecutionError(
@@ -170,12 +177,13 @@ class Portfolio:
         notional = exec_price * quantity
         commission = notional * self.commission_pct
         cost = notional + commission
-        if cost > self.cash:
+        if enforce_funds and cost > self.cash:
             raise InsufficientFundsError(
                 f"Coste {cost:.2f} > efectivo {self.cash:.2f} para {symbol}")
 
         self.cash -= cost
-        self.positions[symbol] = Position(symbol, quantity, exec_price)
+        self.positions[symbol] = Position(symbol, quantity, exec_price,
+                                          entry_commission=commission)
         trade = Trade(symbol, "buy", quantity, exec_price, commission)
         self.trades.append(trade)
         return trade
@@ -214,11 +222,15 @@ class Portfolio:
         notional = exec_price * quantity
         commission = notional * self.commission_pct
         self.cash += notional - commission
-        pnl = (exec_price - pos.entry_price) * quantity - commission
+        # P&L del viaje completo: incluye la parte proporcional de la
+        # comisión de entrada (antes solo se descontaba la de salida).
+        entry_fee = pos.entry_commission * (quantity / pos.quantity)
+        pnl = (exec_price - pos.entry_price) * quantity - commission - entry_fee
         if quantity == pos.quantity:
             del self.positions[symbol]
         else:
             pos.quantity -= quantity
+            pos.entry_commission -= entry_fee
         trade = Trade(symbol, "sell", quantity, exec_price, commission, pnl)
         self.trades.append(trade)
         return trade

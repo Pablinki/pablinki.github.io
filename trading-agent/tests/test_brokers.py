@@ -59,7 +59,10 @@ class FakeSession:
         self.responses.append((method, path_suffix, FakeResponse(**kwargs),
                                sticky))
 
-    def request(self, method: str, url: str, json=None, timeout=None):
+    def request(self, method: str, url: str, json=None, timeout=None,
+                **kwargs):
+        # El adaptador debe pedir siempre allow_redirects=False (seguridad).
+        assert kwargs.get("allow_redirects") is False
         self.calls.append((method, url, json))
         for i, (m, suffix, resp, sticky) in enumerate(self.responses):
             if m == method and url.endswith(suffix):
@@ -163,6 +166,28 @@ class TestAlpacaSecurity:
         assert session.headers["APCA-API-KEY-ID"] == "clave-test"
         assert session.headers["APCA-API-SECRET-KEY"] == "secreto-test"
 
+    @pytest.mark.parametrize("url", [
+        "https://evil.example.com",                     # host ajeno
+        "https://api.alpaca.markets.evil.com",          # sufijo engañoso
+        "https://user:pass@paper-api.alpaca.markets",   # credenciales en URL
+        "https://paper-api.alpaca.markets/?x=1",        # parámetros
+    ])
+    def test_disallowed_urls_are_rejected(self, monkeypatch, url):
+        monkeypatch.setenv("ALPACA_API_KEY", "k")
+        monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+        monkeypatch.setenv("ALPACA_BASE_URL", url)
+        monkeypatch.setenv("TRADING_AGENT_LIVE", "YES")
+        with pytest.raises(SecurityError):
+            AlpacaBroker(Portfolio(cash=1.0), session=FakeSession())
+
+    def test_redirects_are_refused(self, monkeypatch):
+        """Las cabeceras con credenciales no deben seguir a otro host."""
+        session = FakeSession()
+        session.queue("GET", "/v2/account", status_code=302, payload={})
+        broker = make_alpaca(monkeypatch, session)
+        with pytest.raises(ExecutionError, match="redirigir"):
+            broker.account_cash()
+
     def test_plain_http_url_is_rejected(self, monkeypatch):
         """Las credenciales viajan en cabeceras: nunca sin TLS."""
         monkeypatch.setenv("ALPACA_API_KEY", "k")
@@ -265,6 +290,20 @@ class TestAlpacaOrders:
         assert (method, body["type"], body["time_in_force"],
                 body["side"], body["qty"]) == ("POST", "market", "day",
                                                "buy", "10")
+
+    def test_fill_above_local_cash_is_still_mirrored(self, monkeypatch):
+        """El fill ya ocurrió: el espejo lo refleja y re-sincroniza el
+        efectivo en vez de rechazarlo con el dinero ya fuera de la cuenta."""
+        session = FakeSession()
+        session.queue("POST", "/v2/orders", payload=order_json("new"))
+        session.queue("GET", "/v2/orders/ord-1",
+                      payload=order_json("filled", price="120.00"))
+        session.queue("GET", "/v2/account", payload=ACCOUNT_OK)
+        broker = make_alpaca(monkeypatch, session, cash=1_000.0)
+        trade = broker.open_position("AAPL", quantity=10, price_hint=100.0)
+        assert trade.quantity == 10
+        assert broker.portfolio.positions["AAPL"].quantity == 10
+        assert broker.portfolio.cash == pytest.approx(50_000.0)  # re-sync
 
     def test_polls_until_filled(self, monkeypatch):
         session = FakeSession()

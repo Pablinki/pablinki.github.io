@@ -27,9 +27,11 @@ Ejemplo (paper trading)::
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import signal
 import threading
+from pathlib import Path
 from types import FrameType
 
 import numpy as np
@@ -66,7 +68,8 @@ class LiveTrader:
                  provider: DataProvider | None = None,
                  broker: BrokerAdapter | None = None,
                  journal: TradeJournal | None = None,
-                 max_consecutive_errors: int = 10) -> None:
+                 max_consecutive_errors: int = 10,
+                 risk_state_path: str | Path | None = None) -> None:
         """
         Args:
             config: configuración de la aplicación.
@@ -82,6 +85,15 @@ class LiveTrader:
             max_consecutive_errors: nº de iteraciones seguidas con error
                 inesperado tras el cual el bucle se detiene (cortacircuitos:
                 un proceso que falla sin parar no debe seguir operando).
+            risk_state_path: archivo JSON donde persiste el estado del
+                RiskManager (pico de equity, kill-switch, enfriamiento).
+                Un reinicio del proceso NO rearma el kill-switch: si está
+                activo en el archivo, el trader se niega a arrancar hasta
+                que un humano lo edite o borre. ``None`` = solo memoria.
+
+        Raises:
+            TradingAgentError: parámetros inválidos, o kill-switch activo
+                en el estado persistido.
         """
         if max_consecutive_errors < 1:
             raise TradingAgentError("max_consecutive_errors debe ser >= 1")
@@ -90,6 +102,8 @@ class LiveTrader:
         self.provider = provider or make_provider(config.data)
         self.symbol = config.data.symbols[0]
         self.risk = RiskManager(config.risk)
+        self.risk_state_path = Path(risk_state_path) if risk_state_path else None
+        self._load_risk_state()
         if broker is None:
             broker = PaperBroker(Portfolio(
                 cash=config.env.initial_cash,
@@ -112,6 +126,71 @@ class LiveTrader:
             self.journal.record(
                 trade, reason=reason,
                 equity=self.portfolio.equity({self.symbol: price}))
+
+    # ------------------------------------------------------------------ #
+    # Estado de riesgo persistente                                       #
+    # ------------------------------------------------------------------ #
+    def _load_risk_state(self) -> None:
+        """Restaura el RiskManager desde disco (si hay archivo).
+
+        Raises:
+            TradingAgentError: si el estado guardado tiene el kill-switch
+                activo (rearmarlo exige intervención humana) o el archivo
+                está corrupto.
+        """
+        if self.risk_state_path is None or not self.risk_state_path.exists():
+            return
+        try:
+            state = json.loads(self.risk_state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise TradingAgentError(
+                f"Estado de riesgo ilegible en {self.risk_state_path}: {exc}"
+            ) from exc
+        self.risk.load_dict(state)
+        logger.info("Estado de riesgo restaurado desde %s: %s",
+                    self.risk_state_path, state)
+        if self.risk.halted:
+            raise TradingAgentError(
+                "Kill-switch de drawdown ACTIVO en el estado persistido "
+                f"({self.risk_state_path}). Revisa la cuenta y borra o edita "
+                "ese archivo para rearmar conscientemente.")
+
+    def _save_risk_state(self) -> None:
+        """Persiste el RiskManager a disco (escritura atómica)."""
+        if self.risk_state_path is None:
+            return
+        try:
+            self.risk_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.risk_state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.risk.to_dict()), encoding="utf-8")
+            tmp.replace(self.risk_state_path)
+        except OSError as exc:
+            logger.error("No se pudo guardar el estado de riesgo en %s: %s",
+                         self.risk_state_path, exc)
+
+    def _reconcile_with_broker(self) -> None:
+        """Re-sincroniza el espejo con el broker y grita si divergían.
+
+        Solo aplica a brokers con ``sync()`` (reales). Se ejecuta una vez
+        por jornada: la contabilidad local debe coincidir con la cuenta;
+        si no (orden manual, fill no visto...), manda la versión del broker.
+        """
+        sync = getattr(self.broker, "sync", None)
+        if not callable(sync):
+            return
+        before_cash = self.portfolio.cash
+        before_pos = {s: p.quantity for s, p in self.portfolio.positions.items()}
+        try:
+            sync()
+        except ExecutionError as exc:
+            logger.error("Reconciliación con el broker fallida: %s", exc)
+            return
+        after_pos = {s: p.quantity for s, p in self.portfolio.positions.items()}
+        if before_pos != after_pos or abs(before_cash - self.portfolio.cash) > 1.0:
+            logger.critical(
+                "DIVERGENCIA espejo/broker corregida: posiciones %s -> %s, "
+                "efectivo %.2f -> %.2f. Revisar el diario y la cuenta.",
+                before_pos, after_pos, before_cash, self.portfolio.cash)
 
     # ------------------------------------------------------------------ #
     # Señales del sistema (Ctrl+C / SIGTERM del orquestador)             #
@@ -200,6 +279,9 @@ class LiveTrader:
         # pérdida diaria con el equity de apertura del día.
         bar_date = bar_ts.date()
         if bar_date != self._last_bar_date:
+            if self._last_bar_date is not None:
+                self._reconcile_with_broker()
+                equity = self.portfolio.equity({self.symbol: price})
             self.risk.start_new_day(equity)
             self._last_bar_date = bar_date
 
@@ -216,6 +298,7 @@ class LiveTrader:
                 trade = self.broker.close_position(self.symbol, price,
                                                    tag=f"{tag}-{reason}")
                 forced_close = reason
+                self.risk.on_forced_close()
                 self._record(trade, reason=reason, price=price)
                 logger.warning("%s: cierre forzoso por %s, P&L %.2f USD",
                                self.symbol, reason, trade.pnl)
@@ -228,6 +311,7 @@ class LiveTrader:
         if stale_bar:
             action = Action.HOLD
         else:
+            self.risk.new_bar()  # consume el enfriamiento tras un stop
             state = self._build_state(feats, price)
             action = Action(self.agent.act(state, greedy=True))
             self._last_decided_bar = bar_ts
@@ -246,6 +330,15 @@ class LiveTrader:
                                                       tag=tag)
                     self._record(trade, reason="agent", price=price)
                     logger.info("%s: COMPRA %g @ %.2f", self.symbol, qty, price)
+                else:
+                    logger.warning(
+                        "%s: compra vetada por tamaño: presupuesto %.2f USD "
+                        "(%.0f%% de %.2f) no alcanza para 1 acción a %.2f",
+                        self.symbol, equity * self.config.risk.max_position_pct,
+                        self.config.risk.max_position_pct * 100, equity, price)
+            else:
+                logger.warning("%s: compra vetada por el gestor de riesgo",
+                               self.symbol)
         elif action == Action.SELL and self.portfolio.has_position(self.symbol):
             trade = self.broker.close_position(self.symbol, price, tag=tag)
             self._record(trade, reason="agent", price=price)
@@ -253,6 +346,7 @@ class LiveTrader:
                         self.symbol, trade.quantity, price, trade.pnl)
 
         equity = self.portfolio.equity({self.symbol: price})
+        self._save_risk_state()
         return {
             "price": price,
             "action": action.name,
@@ -348,7 +442,8 @@ class LiveTrader:
 
 def build_live_trader(config: AppConfig, checkpoint_path: str,
                       broker_name: str = "paper",
-                      journal_path: str | None = None) -> LiveTrader:
+                      journal_path: str | None = None,
+                      risk_state_path: str | None = None) -> LiveTrader:
     """Construye un :class:`LiveTrader` con el checkpoint indicado.
 
     Args:
@@ -360,6 +455,8 @@ def build_live_trader(config: AppConfig, checkpoint_path: str,
             sincronizan efectivo y posiciones abiertas con la cuenta.
         journal_path: ruta del diario CSV de operaciones; ``None`` lo
             desactiva.
+        risk_state_path: archivo JSON del estado de riesgo persistente
+            (ver :class:`LiveTrader`); ``None`` = solo memoria.
 
     Returns:
         ``LiveTrader`` listo para :meth:`LiveTrader.run_forever`.
@@ -388,4 +485,5 @@ def build_live_trader(config: AppConfig, checkpoint_path: str,
         if callable(sync):
             sync()  # efectivo + posiciones reales (sobrevive a reinicios)
     journal = TradeJournal(journal_path) if journal_path else None
-    return LiveTrader(config, agent, broker=broker, journal=journal)
+    return LiveTrader(config, agent, broker=broker, journal=journal,
+                      risk_state_path=risk_state_path)

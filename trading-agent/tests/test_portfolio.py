@@ -70,6 +70,29 @@ class TestClosePosition:
         expected = cash_after_buy + sell_price * 10 * 0.999  # - comisión
         assert p.cash == pytest.approx(expected)
 
+    def test_realized_pnl_includes_entry_commission(self):
+        """El P&L realizado es el del viaje completo: ambas comisiones."""
+        p = make_portfolio(commission=0.01)       # 1% por pata
+        p.open_position("AAPL", price=100.0, quantity=10)   # fee entrada 10
+        trade = p.close_position("AAPL", price=100.0)       # fee salida 10
+        assert trade.pnl == pytest.approx(-20.0)
+        # Y coincide exactamente con la variación de efectivo.
+        assert p.cash - 10_000.0 == pytest.approx(trade.pnl)
+
+    def test_partial_close_prorates_entry_commission(self):
+        p = make_portfolio(commission=0.01)
+        p.open_position("AAPL", price=100.0, quantity=10)
+        t1 = p.reduce_position("AAPL", price=100.0, quantity=5)
+        t2 = p.reduce_position("AAPL", price=100.0, quantity=5)
+        assert t1.pnl + t2.pnl == pytest.approx(-20.0)
+
+    def test_enforce_funds_false_mirrors_real_fill(self):
+        """Un broker real refleja el fill aunque el efectivo local no cuadre."""
+        p = make_portfolio(cash=100.0)
+        trade = p.open_position("AAPL", price=100.0, quantity=10,
+                                enforce_funds=False)
+        assert trade.quantity == 10 and p.cash == pytest.approx(-900.0)
+
     def test_close_without_position_raises(self):
         with pytest.raises(ExecutionError, match="No hay posición"):
             make_portfolio().close_position("AAPL", price=100.0)

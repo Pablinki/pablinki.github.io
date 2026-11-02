@@ -195,7 +195,10 @@ evalúan antes de consultar a la red):
 1. **Dimensionamiento** *fixed-fraction*: nunca más de `max_position_pct`
    del equity en una posición.
 2. **Stop-loss / take-profit** por posición: cierre forzoso a
-   `-stop_loss_pct` / `+take_profit_pct`.
+   `-stop_loss_pct` / `+take_profit_pct`. En backtest se evalúan
+   **intrabarra** (contra el mínimo/máximo de la vela, ejecutando al nivel
+   del stop o a la apertura si hay hueco), igual que en vivo se evalúan con
+   cada precio. Tras un cierre forzoso, `cooldown_bars` velas sin reentrar.
 3. **Límite de pérdida diaria**: superada, no se abren posiciones nuevas
    ese día.
 4. **Kill-switch de drawdown**: si el equity cae `max_drawdown_pct` desde
@@ -303,6 +306,19 @@ supervisión:
   bucle continúa; `max_consecutive_errors` (10) errores seguidos lo
   detienen. Pase lo que pase (señal, kill-switch, excepción), la
   liquidación final se intenta siempre (`finally`).
+- **Estado de riesgo persistente** (`--risk-state logs/risk_state.json`):
+  pico de equity, kill-switch y enfriamiento sobreviven a un reinicio. Si
+  el proceso paró por drawdown, **se niega a arrancar** hasta que un humano
+  borre o edite ese archivo: un reinicio automático nunca rearma el
+  kill-switch solo.
+- **Reconciliación diaria**: con un broker real, al cambiar de jornada el
+  espejo local se re-sincroniza con la cuenta (efectivo y posiciones); una
+  divergencia se registra como `CRITICAL` y manda la versión del broker.
+- **Órdenes idempotentes** (Alpaca): cada decisión lleva un
+  `client_order_id` determinista; si el proceso muere tras enviar la orden
+  y vuelve a intentarlo, Alpaca la rechaza como duplicada y el adaptador la
+  recupera por id en lugar de comprar dos veces. Los fills parciales tras
+  un timeout se reflejan en el espejo (nunca acciones reales sin contar).
 - **Docker**: `Dockerfile` listo para desplegar (imagen `python:3.11-slim`,
   torch CPU, usuario sin privilegios, `SIGTERM` → parada limpia):
 

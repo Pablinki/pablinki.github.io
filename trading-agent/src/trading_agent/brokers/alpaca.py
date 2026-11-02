@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..exceptions import ExecutionError, SecurityError
 from ..portfolio import Portfolio, Position, Trade
@@ -41,6 +42,9 @@ logger = logging.getLogger(__name__)
 
 #: URL del entorno paper (dinero ficticio). Es el defecto deliberadamente.
 PAPER_URL = "https://paper-api.alpaca.markets"
+
+#: Únicos hosts a los que se envían las credenciales.
+ALLOWED_HOSTS = frozenset({"paper-api.alpaca.markets", "api.alpaca.markets"})
 
 #: Estados terminales de una orden que significan "no se ejecutó".
 _FAILED_STATES = frozenset({"canceled", "expired", "rejected", "suspended",
@@ -78,10 +82,19 @@ class AlpacaBroker(BrokerAdapter):
         secret = get_secret("ALPACA_SECRET_KEY")
         self.base_url = (get_secret("ALPACA_BASE_URL", required=False)
                          or PAPER_URL).rstrip("/")
-        if not self.base_url.startswith("https://"):
-            # Las credenciales viajan en cabeceras: nunca en claro.
+        parts = urlsplit(self.base_url)
+        # Las credenciales viajan en cabeceras: solo TLS y solo hacia hosts
+        # de Alpaca (sin usuario:clave, parámetros ni fragmentos en la URL).
+        if (parts.scheme != "https" or parts.username or parts.password
+                or parts.query or parts.fragment):
             raise SecurityError(
-                f"ALPACA_BASE_URL debe usar https://, no {self.base_url!r}")
+                "ALPACA_BASE_URL debe ser https:// sin credenciales ni "
+                f"parámetros, no {parts.hostname!r}")
+        if parts.hostname not in ALLOWED_HOSTS:
+            raise SecurityError(
+                f"Host {parts.hostname!r} no permitido para ALPACA_BASE_URL; "
+                f"use uno de {sorted(ALLOWED_HOSTS)}")
+        self.host = parts.hostname
         self.is_paper = self.base_url == PAPER_URL
         if not self.is_paper:
             # Dinero real: exige la habilitación consciente del operador.
@@ -123,10 +136,17 @@ class AlpacaBroker(BrokerAdapter):
         """
         url = f"{self.base_url}{path}"
         try:
-            resp = self._session.request(method, url, json=json, timeout=15)
+            # Sin seguir redirecciones: las cabeceras con credenciales no
+            # deben viajar a un host distinto del verificado.
+            resp = self._session.request(method, url, json=json, timeout=15,
+                                         allow_redirects=False)
         except Exception as exc:
-            raise ExecutionError(f"Fallo de red hacia Alpaca ({path}): {exc}"
-                                 ) from exc
+            raise ExecutionError(f"Fallo de red hacia {self.host} ({path}): "
+                                 f"{type(exc).__name__}") from exc
+        if 300 <= resp.status_code < 400:
+            raise ExecutionError(
+                f"Alpaca intentó redirigir {path} ({resp.status_code}); "
+                "rechazado por seguridad")
         if resp.status_code not in ok_status:
             raise ExecutionError(
                 f"Alpaca respondió {resp.status_code} en {path}: "
@@ -354,8 +374,19 @@ class AlpacaBroker(BrokerAdapter):
         logger.info("Alpaca BUY %s: %g @ %.4f (referencia %.4f, desvío %+.2f%%)",
                     symbol, filled_qty, fill_price, price_hint,
                     (fill_price / price_hint - 1.0) * 100 if price_hint else 0.0)
-        # Espejo contable al precio real de ejecución (costes incluidos).
-        return self.portfolio.open_position(symbol, fill_price, filled_qty)
+        # Espejo contable al precio real de ejecución (costes incluidos). El
+        # fill YA ocurrió: se refleja aunque el efectivo local no cuadre
+        # (p. ej. fill por encima del margen) y se re-sincroniza después.
+        trade = self.portfolio.open_position(symbol, fill_price, filled_qty,
+                                             enforce_funds=False)
+        if self.portfolio.cash < 0:
+            logger.warning("Efectivo espejo negativo tras el fill (%.2f): "
+                           "re-sincronizando con la cuenta", self.portfolio.cash)
+            try:
+                self.sync_cash()
+            except ExecutionError as exc:
+                logger.error("No se pudo re-sincronizar el efectivo: %s", exc)
+        return trade
 
     def close_position(self, symbol: str, price_hint: float, *,
                        tag: str | None = None) -> Trade:

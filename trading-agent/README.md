@@ -92,7 +92,7 @@ Requiere **Python 3.10–3.12** (probado con 3.11). Las versiones de
 cd trading-agent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt        # numpy 1.26 + pandas 2.2 + torch 2.6 ...
-pytest                                  # verifica la instalación: 264 tests
+pytest                                  # verifica la instalación: 279 tests
 ```
 
 ---
@@ -372,7 +372,7 @@ supervisión:
 
 ## Tests
 
-264 tests automatizados (`pytest`) que **no tocan la red**: los datos de mercado se
+279 tests automatizados (`pytest`) que **no tocan la red**: los datos de mercado se
 generan sintéticamente con semilla fija (deterministas, corren en CI sin
 credenciales).
 

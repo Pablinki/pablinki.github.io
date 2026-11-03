@@ -92,7 +92,7 @@ Requiere **Python 3.10–3.12** (probado con 3.11). Las versiones de
 cd trading-agent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt        # numpy 1.26 + pandas 2.2 + torch 2.6 ...
-pytest                                  # verifica la instalación: 135 tests
+pytest                                  # verifica la instalación: 264 tests
 ```
 
 ---
@@ -372,7 +372,7 @@ supervisión:
 
 ## Tests
 
-135 tests automatizados (`pytest`) que **no tocan la red**: los datos de mercado se
+264 tests automatizados (`pytest`) que **no tocan la red**: los datos de mercado se
 generan sintéticamente con semilla fija (deterministas, corren en CI sin
 credenciales).
 
@@ -395,8 +395,14 @@ Cobertura por área:
   sincronización de la red objetivo, guardado/carga de checkpoints.
 - `test_train.py` — split temporal anti look-ahead + entrenamiento
   end-to-end de humo.
-- `test_live.py` — bucle en vivo con proveedor falso: sobrevive a fallos
-  de datos, liquida al parar; y toda la capa de seguridad.
+- `test_live.py` — bucle en vivo con proveedor falso: una decisión por
+  vela, mercado cerrado, diario, cortacircuitos, estado de riesgo
+  persistente, reconciliación, heartbeat; y toda la capa de seguridad.
+- `test_brokers.py` — Alpaca con sesión HTTP falsa: fills, sondeo,
+  idempotencia (`client_order_id`), fills parciales, timeout + cancelación,
+  allowlist de hosts, redirecciones, sincronización de cuenta.
+- `test_metrics.py`, `test_journal.py`, `test_cli.py` — métricas de
+  evaluación, diario CSV, healthcheck y logging.
 
 ---
 

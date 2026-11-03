@@ -120,7 +120,7 @@ pandas 2.2.3, torch 2.6.0, yfinance 0.2.54, etc.).
 pytest
 ```
 
-Deben pasar **135 tests** (tardan menos de un minuto; no necesitan
+Deben pasar **264 tests** (tardan menos de un minuto; no necesitan
 internet: usan datos sintéticos). Si todos están en verde, la instalación
 es correcta.
 

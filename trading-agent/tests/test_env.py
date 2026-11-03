@@ -294,6 +294,20 @@ class TestSummary:
         last = env._prices[env._t]
         assert s["buy_and_hold_return_pct"] == pytest.approx(last / first - 1.0)
 
+    def test_sharpe_uses_the_configured_periods_per_year(self, small_ohlcv):
+        def run(ppy):
+            env = TradingEnvironment(small_ohlcv, EnvConfig(window_size=10),
+                                     RiskConfig(), symbol="TEST",
+                                     periods_per_year=ppy)
+            env.reset()
+            done, first = False, True
+            while not done:
+                _, _, done, _ = env.step(Action.BUY if first else Action.HOLD)
+                first = False
+            return env.episode_summary()["sharpe"]
+
+        assert run(252 * 4) == pytest.approx(run(252) * 2.0)
+
     def test_equity_curve_tracks_every_step(self, small_ohlcv):
         env = make_env(small_ohlcv)
         env.reset()

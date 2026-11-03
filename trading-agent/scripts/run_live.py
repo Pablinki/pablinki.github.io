@@ -82,7 +82,13 @@ def main() -> int:
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
-    configure_logging(args.log_level, args.log_file or None)
+    try:
+        configure_logging(args.log_level, args.log_file or None)
+    except (OSError, ValueError) as exc:
+        # Sin log no se opera: salida controlada (código 1), no una traza.
+        print(f"No se pudo configurar el logging ({args.log_file!r}): {exc}",
+              file=sys.stderr)
+        return 1
     log = logging.getLogger(__name__)
 
     try:

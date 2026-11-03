@@ -29,6 +29,7 @@ El cliente HTTP es inyectable (cualquier objeto con la interfaz de
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 import time
 from typing import Any
@@ -62,6 +63,8 @@ class AlpacaBroker(BrokerAdapter):
             uno real (inyectable en tests).
         order_timeout_s: segundos máximos esperando el fill de una orden.
         poll_interval_s: segundos entre sondeos del estado de la orden.
+        cancel_wait_s: segundos máximos esperando a que una cancelación
+            (asíncrona en Alpaca) llegue a estado terminal.
 
     Raises:
         SecurityError: si faltan credenciales, o si la URL apunta al
@@ -71,7 +74,8 @@ class AlpacaBroker(BrokerAdapter):
 
     def __init__(self, portfolio: Portfolio, *, session: Any = None,
                  order_timeout_s: float = 30.0,
-                 poll_interval_s: float = 0.5) -> None:
+                 poll_interval_s: float = 0.5,
+                 cancel_wait_s: float = 10.0) -> None:
         super().__init__(portfolio)
         if portfolio.commission_pct != 0.0 or portfolio.slippage_pct != 0.0:
             raise ExecutionError(
@@ -96,7 +100,10 @@ class AlpacaBroker(BrokerAdapter):
                 f"Host {parts.hostname!r} no permitido para ALPACA_BASE_URL; "
                 f"use uno de {sorted(ALLOWED_HOSTS)}")
         self.host = parts.hostname
-        self.is_paper = self.base_url == PAPER_URL
+        # Paper vs real se decide por el host validado (no por igualdad
+        # textual de la URL: mayúsculas o un puerto explícito no cambian el
+        # entorno al que se habla).
+        self.is_paper = parts.hostname == "paper-api.alpaca.markets"
         if not self.is_paper:
             # Dinero real: exige la habilitación consciente del operador.
             assert_live_trading_allowed()
@@ -115,8 +122,20 @@ class AlpacaBroker(BrokerAdapter):
         })
         self.order_timeout_s = order_timeout_s
         self.poll_interval_s = poll_interval_s
+        self.cancel_wait_s = cancel_wait_s
         self._last_order_id: str | None = None
         self._last_client_order_id: str | None = None
+        # Idempotencia por intento: cada decisión (símbolo, lado, vela) lleva
+        # un contador de intentos que avanza solo tras un desenlace
+        # terminal; un reintento por fallo de red reutiliza el mismo id y
+        # recupera la orden, un reintento tras rechazo/parcial envía una
+        # orden NUEVA. El prefijo por proceso evita recuperar órdenes
+        # históricas tras un reinicio (sync() ya refleja sus fills).
+        self._run_id = f"{int(time.time() * 1000):x}"[-6:]
+        self._attempts: dict[str, int] = {}
+        self._attempt_keys: dict[str, str] = {}  # client_order_id -> clave
+        self._accounted: set[str] = set()  # ids de orden ya reflejados
+        self._symbols: tuple[str, ...] | None = None
 
     # ------------------------------------------------------------------ #
     # HTTP                                                               #
@@ -154,6 +173,8 @@ class AlpacaBroker(BrokerAdapter):
             raise ExecutionError(
                 f"Alpaca respondió {resp.status_code} en {path}: "
                 f"{resp.text[:300]}")
+        if resp.status_code == 204 or not getattr(resp, "content", b"x"):
+            return {}  # sin cuerpo (p. ej. DELETE aceptado)
         try:
             return resp.json()
         except ValueError as exc:
@@ -204,7 +225,9 @@ class AlpacaBroker(BrokerAdapter):
         raw = self._request("GET", "/v2/positions")
         if not isinstance(raw, list):
             raise ExecutionError("Respuesta inesperada de /v2/positions")
-        self.portfolio.positions.clear()
+        # Se construye y valida aparte: si algo falla, el espejo anterior
+        # queda intacto en vez de medio borrado.
+        mirrored: dict[str, Position] = {}
         for p in raw:
             symbol = p.get("symbol", "?")
             if symbols is not None and symbol not in symbols:
@@ -217,10 +240,11 @@ class AlpacaBroker(BrokerAdapter):
                 raise ExecutionError(
                     f"Posición no soportada en {symbol}: "
                     f"side={p.get('side')!r} qty={qty}")
-            self.portfolio.positions[symbol] = Position(
-                symbol, qty, float(p["avg_entry_price"]))
+            mirrored[symbol] = Position(symbol, qty, float(p["avg_entry_price"]))
             logger.info("Posición sincronizada desde Alpaca: %s %g @ %.4f",
                         symbol, qty, float(p["avg_entry_price"]))
+        self.portfolio.positions.clear()
+        self.portfolio.positions.update(mirrored)
 
     def sync(self, symbols: tuple[str, ...] | None = None) -> None:
         """Sincroniza efectivo y posiciones (llamar al arrancar y cada día).
@@ -228,6 +252,7 @@ class AlpacaBroker(BrokerAdapter):
         Args:
             symbols: ver :meth:`sync_positions`.
         """
+        self._symbols = symbols
         self.sync_cash()
         self.sync_positions(symbols)
 
@@ -306,13 +331,35 @@ class AlpacaBroker(BrokerAdapter):
         except ExecutionError:
             logger.error("No se pudo cancelar la orden %s tras el timeout. "
                          "REVISAR EN EL DASHBOARD.", order_id)
-        try:
-            final = self._request("GET", f"/v2/orders/{order_id}")
-        except ExecutionError:
-            final = {}
+        # La cancelación es ASÍNCRONA (pending_cancel): una orden market
+        # puede ejecutarse entre el DELETE y la confirmación. Solo un estado
+        # terminal dice cuántas acciones son reales.
+        deadline = time.monotonic() + self.cancel_wait_s
+        final: dict = {}
+        while True:
+            try:
+                final = self._request("GET", f"/v2/orders/{order_id}")
+            except ExecutionError:
+                final = {}
+            status = final.get("status")
+            if status == "filled" or status in _FAILED_STATES:
+                break
+            if time.monotonic() >= deadline:
+                logger.critical(
+                    "Orden %s sin estado terminal tras cancelar (%r). El "
+                    "espejo puede divergir: se re-sincroniza con la cuenta. "
+                    "REVISAR EN EL DASHBOARD.", order_id, status)
+                try:
+                    self.sync(self._symbols)
+                except ExecutionError as exc:
+                    logger.error("Re-sincronización fallida: %s", exc)
+                raise ExecutionError(
+                    f"Orden {order_id} en estado no terminal {status!r} tras "
+                    f"cancelar; espejo re-sincronizado")
+            time.sleep(self.poll_interval_s)
         if float(final.get("filled_qty") or 0) > 0:
-            logger.warning("Orden %s cancelada tras timeout con fill parcial "
-                           "%s @ %s", order_id, final.get("filled_qty"),
+            logger.warning("Orden %s %s tras timeout con fill %s @ %s",
+                           order_id, final.get("status"), final.get("filled_qty"),
                            final.get("filled_avg_price"))
             return final
         raise ExecutionError(
@@ -358,15 +405,35 @@ class AlpacaBroker(BrokerAdapter):
                 order = self._request(
                     "GET", "/v2/orders:by_client_order_id"
                            f"?client_order_id={client_order_id}")
+                if str(order.get("id")) in self._accounted:
+                    # Ya reflejada en el espejo: repetirla duplicaría la
+                    # contabilidad. Un nuevo intento usará otro id.
+                    self._bump_attempt(client_order_id)
+                    raise ExecutionError(
+                        f"Orden {client_order_id} ya contabilizada; no se "
+                        "repite") from exc
             else:
-                raise
-        filled = self._await_fill(order["id"])
+                raise  # fallo de red: el mismo id recuperará la orden
+        try:
+            filled = self._await_fill(order["id"])
+        except ExecutionError:
+            self._bump_attempt(client_order_id)  # desenlace terminal sin fill
+            raise
         filled_qty = float(filled["filled_qty"])
         if filled_qty <= 0:
+            self._bump_attempt(client_order_id)
             raise ExecutionError(f"Orden {order['id']} sin acciones ejecutadas")
         self._last_order_id = str(order["id"])
         self._last_client_order_id = client_order_id
+        self._accounted.add(self._last_order_id)
+        self._bump_attempt(client_order_id)  # el siguiente intento es nuevo
         return filled_qty, float(filled["filled_avg_price"])
+
+    def _bump_attempt(self, client_order_id: str | None) -> None:
+        """Avanza el contador de intentos de la decisión de ese id."""
+        if client_order_id and client_order_id in self._attempt_keys:
+            key = self._attempt_keys.pop(client_order_id)
+            self._attempts[key] = self._attempts.get(key, 0) + 1
 
     def _tag_trade(self, trade: Trade) -> Trade:
         """Devuelve el trade con los ids de orden del último fill y lo
@@ -378,13 +445,29 @@ class AlpacaBroker(BrokerAdapter):
             self.portfolio.trades[-1] = tagged
         return tagged
 
-    @staticmethod
-    def _client_order_id(symbol: str, side: str, tag: str | None) -> str | None:
-        """Id de cliente determinista por decisión (≤ 48 caracteres)."""
+    def _client_order_id(self, symbol: str, side: str, tag: str | None) -> str | None:
+        """Id de cliente idempotente por (proceso, decisión, intento).
+
+        Formato ``{run}-{símbolo}-{b|s}-{hash10(tag)}-{intento}`` (≤ 40
+        caracteres). El hash evita colisiones por truncado; el intento
+        avanza solo tras un desenlace terminal (ver :meth:`_market_order`).
+
+        Args:
+            symbol: ticker.
+            side: ``"buy"`` o ``"sell"``.
+            tag: identificador de la decisión (vela [+ motivo]).
+
+        Returns:
+            El id, o ``None`` si no hay tag (orden sin idempotencia).
+        """
         if not tag:
             return None
-        safe = "".join(c if c.isalnum() else "-" for c in tag)
-        return f"ta-{symbol}-{side}-{safe}"[:48]
+        key = f"{symbol}-{side}-{tag}"
+        digest = hashlib.sha1(tag.encode("utf-8")).hexdigest()[:10]
+        attempt = self._attempts.get(key, 0)
+        cid = f"{self._run_id}-{symbol}-{side[0]}-{digest}-{attempt}"
+        self._attempt_keys[cid] = key
+        return cid
 
     # ------------------------------------------------------------------ #
     # Interfaz BrokerAdapter                                             #

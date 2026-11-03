@@ -43,6 +43,8 @@ def check(heartbeat_path: str | Path, *, max_age_s: float,
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         written = dt.datetime.fromisoformat(data["utc"])
+        if written.tzinfo is None:  # sin zona: se asume UTC
+            written = written.replace(tzinfo=dt.timezone.utc)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return False, f"heartbeat ilegible: {exc}"
     now = now or dt.datetime.now(dt.timezone.utc)

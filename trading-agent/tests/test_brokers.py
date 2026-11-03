@@ -24,15 +24,20 @@ from trading_agent.portfolio import Portfolio
 # Infraestructura de test                                               #
 # --------------------------------------------------------------------- #
 class FakeResponse:
-    """Respuesta HTTP mínima con la interfaz que usa el adaptador."""
+    """Respuesta HTTP mínima con la interfaz que usa el adaptador.
 
-    def __init__(self, status_code: int = 200, payload: dict | None = None,
+    ``payload=None`` modela una respuesta sin cuerpo (p. ej. 204): como
+    en ``requests``, ``.content`` queda vacío y ``.json()`` lanza.
+    """
+
+    def __init__(self, status_code: int = 200, payload=None,
                  text: str = "") -> None:
         self.status_code = status_code
-        self._payload = payload if payload is not None else {}
-        self.text = text or str(self._payload)
+        self._payload = payload
+        self.content = b"" if payload is None else b"{}"
+        self.text = text or (str(payload) if payload is not None else "")
 
-    def json(self) -> dict:
+    def json(self):
         if self._payload is None:
             raise ValueError("sin JSON")
         return self._payload
@@ -53,6 +58,9 @@ class FakeSession:
         self.headers: dict = {}
         self.responses: list[tuple[str, str, FakeResponse, bool]] = []
         self.calls: list[tuple[str, str, dict | None]] = []
+        # Responder programable (tiene prioridad): fn(method, url, json,
+        # calls) -> FakeResponse | None. Permite fakes con estado.
+        self.responder = None
 
     def queue(self, method: str, path_suffix: str, *, sticky: bool = False,
               **kwargs) -> None:
@@ -64,11 +72,17 @@ class FakeSession:
         # El adaptador debe pedir siempre allow_redirects=False (seguridad).
         assert kwargs.get("allow_redirects") is False
         self.calls.append((method, url, json))
-        for i, (m, suffix, resp, sticky) in enumerate(self.responses):
-            if m == method and url.endswith(suffix):
-                if not sticky:
-                    self.responses.pop(i)
+        if self.responder is not None:
+            resp = self.responder(method, url, json, self.calls)
+            if resp is not None:
                 return resp
+        # Las respuestas de un solo uso tienen prioridad sobre las sticky.
+        for want_sticky in (False, True):
+            for i, (m, suffix, resp, sticky) in enumerate(self.responses):
+                if sticky == want_sticky and m == method and url.endswith(suffix):
+                    if not sticky:
+                        self.responses.pop(i)
+                    return resp
         raise AssertionError(f"Petición inesperada: {method} {url}")
 
 
@@ -83,6 +97,37 @@ def order_json(status: str, *, order_id: str = "ord-1", qty: str | None = None,
         qty = "10" if status == "filled" else "0"
     return {"id": order_id, "status": status, "filled_qty": qty,
             "filled_avg_price": price}
+
+
+def cancel_flow_session(*, before=("new", "0"), after=(("canceled", "0"),),
+                        price: str = "100.50") -> FakeSession:
+    """Sesión con estado para el flujo timeout -> DELETE -> lectura final.
+
+    ``GET /v2/orders/ord-1`` devuelve ``before`` (estado, qty) hasta que se
+    envía el DELETE; después recorre ``after`` en orden y repite el último
+    (la cancelación de Alpaca es asíncrona: pending_cancel -> terminal).
+    """
+    session = FakeSession()
+
+    def responder(method, url, json, calls):
+        if method == "POST" and url.endswith("/v2/orders"):
+            return FakeResponse(payload=order_json("new"))
+        if method == "DELETE":
+            return FakeResponse(status_code=204)
+        if method == "GET" and url.endswith("/v2/orders/ord-1"):
+            delete_idx = next((i for i, (m, _, _) in enumerate(calls)
+                               if m == "DELETE"), None)
+            if delete_idx is None:
+                st, q = before
+            else:
+                n_after = sum(1 for m, _, _ in calls[delete_idx + 1:]
+                              if m == "GET") - 1
+                st, q = after[min(n_after, len(after) - 1)]
+            return FakeResponse(payload=order_json(st, qty=q, price=price))
+        return None
+
+    session.responder = responder
+    return session
 
 
 def make_alpaca(monkeypatch, session: FakeSession | None = None,
@@ -136,6 +181,15 @@ class TestAlpacaSecurity:
         broker = make_alpaca(monkeypatch)
         assert broker.is_paper
         assert broker.base_url == PAPER_URL
+
+    def test_paper_is_decided_by_hostname_not_exact_text(self, monkeypatch):
+        """Mayúsculas o puerto explícito no convierten paper en real."""
+        monkeypatch.setenv("ALPACA_API_KEY", "k")
+        monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+        monkeypatch.delenv("TRADING_AGENT_LIVE", raising=False)
+        monkeypatch.setenv("ALPACA_BASE_URL", "https://PAPER-API.alpaca.markets:443")
+        broker = AlpacaBroker(Portfolio(cash=1.0), session=FakeSession())
+        assert broker.is_paper
 
     def test_live_url_without_flag_raises(self, monkeypatch):
         monkeypatch.setenv("ALPACA_API_KEY", "k")
@@ -263,7 +317,8 @@ class TestAlpacaSync:
         trade = broker.open_position("AAPL", quantity=10, price_hint=100.0,
                                      tag="2026-01-02T15:00:00")
         assert trade.order_id == "o-77"
-        assert trade.client_order_id == "ta-AAPL-buy-2026-01-02T15-00-00"
+        assert trade.client_order_id and trade.client_order_id.startswith(
+            f"{broker._run_id}-AAPL-b-")
         assert broker.portfolio.trades[-1].order_id == "o-77"
 
     def test_sync_positions_rejects_shorts(self, monkeypatch):
@@ -363,32 +418,122 @@ class TestAlpacaOrders:
         """Idempotencia: si Alpaca ya tiene la orden (422 por client_order_id
         duplicado), se recupera por id en vez de comprar dos veces."""
         session = FakeSession()
+        broker = make_alpaca(monkeypatch, session)
+        cid = broker._client_order_id("AAPL", "buy", "2026-01-02T15:00:00")
+        assert len(cid) <= 48 and cid.startswith(broker._run_id)
         session.queue("POST", "/v2/orders", status_code=422,
                       payload={"message": "client_order_id must be unique"})
-        session.queue("GET", "client_order_id=ta-AAPL-buy-2026-01-02T15-00-00",
+        session.queue("GET", f"client_order_id={cid}",
                       payload=order_json("new", order_id="ord-9"))
         session.queue("GET", "/v2/orders/ord-9",
                       payload=order_json("filled", order_id="ord-9"))
-        broker = make_alpaca(monkeypatch, session)
         trade = broker.open_position("AAPL", quantity=10, price_hint=100.0,
                                      tag="2026-01-02T15:00:00")
         assert trade.quantity == 10
         posted = [c for c in session.calls if c[0] == "POST"]
-        assert posted[0][2]["client_order_id"] == "ta-AAPL-buy-2026-01-02T15-00-00"
+        assert posted[0][2]["client_order_id"] == cid
         assert len(posted) == 1  # no se reenvió la compra
 
     def test_timeout_with_partial_fill_mirrors_filled_shares(self, monkeypatch):
         """Tras cancelar por timeout, las acciones ya ejecutadas son reales:
-        deben entrar en el espejo (antes se descartaban)."""
+        deben entrar en el espejo (antes se descartaban). La cancelación es
+        asíncrona: solo cuenta el estado TERMINAL leído tras el DELETE."""
+        session = cancel_flow_session(
+            before=("partially_filled", "3"),
+            after=(("pending_cancel", "3"), ("canceled", "4")))
+        broker = make_alpaca(monkeypatch, session, order_timeout_s=0.01)
+        trade = broker.open_position("AAPL", quantity=10, price_hint=100.0)
+        # Se ejecutó UNA acción más entre el DELETE y la confirmación: el
+        # espejo refleja el estado terminal (4), no la lectura previa (3).
+        assert trade.quantity == 4
+        assert broker.portfolio.positions["AAPL"].quantity == 4
+
+    def test_cancel_that_never_turns_terminal_resyncs_and_raises(self, monkeypatch, caplog):
         session = FakeSession()
         session.queue("POST", "/v2/orders", payload=order_json("new"))
         session.queue("GET", "/v2/orders/ord-1", sticky=True,
-                      payload=order_json("partially_filled", qty="3"))
+                      payload=order_json("pending_cancel"))
         session.queue("DELETE", "/v2/orders/ord-1", status_code=204)
+        session.queue("GET", "/v2/account", payload=ACCOUNT_OK)
+        session.queue("GET", "/v2/positions", payload=[])
+        broker = make_alpaca(monkeypatch, session, order_timeout_s=0.01,
+                             cancel_wait_s=0.01)
+        with caplog.at_level("CRITICAL"), pytest.raises(ExecutionError, match="no terminal"):
+            broker.open_position("AAPL", quantity=10, price_hint=100.0)
+        assert "re-sincroniza" in caplog.text
+        assert broker.portfolio.cash == pytest.approx(50_000.0)  # sync corrió
+
+    def test_retry_after_partial_fill_sends_a_new_order(self, monkeypatch):
+        """Mismo tag (misma vela) tras un fill parcial: el reintento debe
+        enviar una orden NUEVA por el resto, no recuperar la antigua y
+        contabilizarla dos veces."""
+        session = FakeSession()
+        session.queue("POST", "/v2/orders", payload=order_json("new", order_id="buy"))
+        session.queue("GET", "/v2/orders/buy", payload=order_json("filled", order_id="buy"))
+        # Primera venta: termina cancelada con 4 de 10.
+        session.queue("POST", "/v2/orders", payload=order_json("new", order_id="s1"))
+        session.queue("GET", "/v2/orders/s1",
+                      payload=order_json("canceled", order_id="s1", qty="4"))
+        # Segunda venta (mismo tag): orden nueva por las 6 restantes.
+        session.queue("POST", "/v2/orders", payload=order_json("new", order_id="s2"))
+        session.queue("GET", "/v2/orders/s2",
+                      payload=order_json("filled", order_id="s2", qty="6"))
+        broker = make_alpaca(monkeypatch, session)
+        broker.open_position("AAPL", quantity=10, price_hint=100.0, tag="T")
+        broker.close_position("AAPL", price_hint=100.0, tag="T-stop_loss")
+        assert broker.portfolio.positions["AAPL"].quantity == 6
+        broker.close_position("AAPL", price_hint=100.0, tag="T-stop_loss")
+        assert not broker.portfolio.has_position("AAPL")
+        posted = [c[2] for c in session.calls if c[0] == "POST"]
+        sell_ids = [b["client_order_id"] for b in posted if b["side"] == "sell"]
+        assert len(sell_ids) == 2 and sell_ids[0] != sell_ids[1]
+        assert posted[-1]["qty"] == "6"
+
+    def test_retry_after_rejection_sends_a_new_order(self, monkeypatch):
+        """Un stop rechazado no puede quedar bloqueado el resto de la vela."""
+        session = FakeSession()
+        session.queue("POST", "/v2/orders", payload=order_json("new", order_id="buy"))
+        session.queue("GET", "/v2/orders/buy", payload=order_json("filled", order_id="buy"))
+        session.queue("POST", "/v2/orders", payload=order_json("new", order_id="s1"))
+        session.queue("GET", "/v2/orders/s1", payload=order_json("rejected", order_id="s1"))
+        session.queue("POST", "/v2/orders", payload=order_json("new", order_id="s2"))
+        session.queue("GET", "/v2/orders/s2", payload=order_json("filled", order_id="s2"))
+        broker = make_alpaca(monkeypatch, session)
+        broker.open_position("AAPL", quantity=10, price_hint=100.0, tag="T")
+        with pytest.raises(ExecutionError, match="rejected"):
+            broker.close_position("AAPL", price_hint=95.0, tag="T-stop_loss")
+        broker.close_position("AAPL", price_hint=95.0, tag="T-stop_loss")
+        assert not broker.portfolio.has_position("AAPL")
+        posted = [c[2] for c in session.calls if c[0] == "POST"]
+        assert posted[1]["client_order_id"] != posted[2]["client_order_id"]
+
+    def test_recovered_order_already_accounted_is_not_mirrored_twice(self, monkeypatch):
+        session = FakeSession()
+        session.queue("POST", "/v2/orders", payload=order_json("new", order_id="o1"))
+        session.queue("GET", "/v2/orders/o1", payload=order_json("filled", order_id="o1"))
+        broker = make_alpaca(monkeypatch, session)
+        trade = broker.open_position("AAPL", quantity=10, price_hint=100.0, tag="T")
+        cid = trade.client_order_id
+        # Simular un reintento con el MISMO id (p. ej. respuesta perdida)
+        # cuya orden ya está contabilizada: Alpaca responde 422 duplicado.
+        broker._attempts.clear()
+        broker._attempt_keys.clear()
+        session.queue("POST", "/v2/orders", status_code=422,
+                      payload={"message": "client_order_id must be unique"})
+        session.queue("GET", f"client_order_id={cid}",
+                      payload=order_json("filled", order_id="o1"))
+        broker.portfolio.positions.clear()  # como si se hubiera vendido
+        with pytest.raises(ExecutionError, match="ya contabilizada"):
+            broker.open_position("AAPL", quantity=10, price_hint=100.0, tag="T")
+        assert not broker.portfolio.has_position("AAPL")  # sin fantasma
+
+    def test_delete_204_is_not_reported_as_failure(self, monkeypatch, caplog):
+        session = cancel_flow_session(before=("new", "0"),
+                                      after=(("canceled", "0"),))  # DELETE -> 204
         broker = make_alpaca(monkeypatch, session, order_timeout_s=0.01)
-        trade = broker.open_position("AAPL", quantity=10, price_hint=100.0)
-        assert trade.quantity == 3
-        assert broker.portfolio.positions["AAPL"].quantity == 3
+        with caplog.at_level("ERROR"), pytest.raises(ExecutionError, match="sin fill"):
+            broker.open_position("AAPL", quantity=10, price_hint=100.0)
+        assert "No se pudo cancelar" not in caplog.text
 
     def test_partial_sell_reduces_mirror_position(self, monkeypatch):
         session = FakeSession()
@@ -415,12 +560,9 @@ class TestAlpacaOrders:
         assert not broker.portfolio.has_position("AAPL")
 
     def test_fill_timeout_cancels_and_raises(self, monkeypatch):
-        session = FakeSession()
-        session.queue("POST", "/v2/orders", payload=order_json("new"))
-        # sticky: la orden responde "new" indefinidamente (nunca se ejecuta).
-        session.queue("GET", "/v2/orders/ord-1", sticky=True,
-                      payload=order_json("new"))
-        session.queue("DELETE", "/v2/orders/ord-1", status_code=204)
+        # La orden responde "new" hasta el DELETE; después, cancelada sin fill.
+        session = cancel_flow_session(before=("new", "0"),
+                                      after=(("canceled", "0"),))
         broker = make_alpaca(monkeypatch, session, order_timeout_s=0.01)
         with pytest.raises(ExecutionError, match="sin fill"):
             broker.open_position("AAPL", quantity=10, price_hint=100.0)

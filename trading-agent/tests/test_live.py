@@ -148,12 +148,25 @@ class ExplodingProvider(DataProvider):
 
 
 def make_forced_trader(action: int, broker=None, journal=None,
-                       provider=None, **kwargs) -> LiveTrader:
+                       provider=None, risk=None, **kwargs) -> LiveTrader:
     base = make_trader()
-    agent = ForcedAgent(action, base.config.env.window_size
+    config = (dataclasses.replace(base.config, risk=risk) if risk is not None
+              else base.config)
+    agent = ForcedAgent(action, config.env.window_size
                         * len(FEATURE_COLUMNS) + 2)
-    return LiveTrader(base.config, agent, provider=provider or base.provider,
+    return LiveTrader(config, agent, provider=provider or base.provider,
                       broker=broker, journal=journal, **kwargs)
+
+
+class ToggleMarketBroker(PaperBroker):
+    """Broker simulado cuyo reloj de mercado se controla desde el test."""
+
+    def __init__(self, portfolio, open_: bool = False) -> None:
+        super().__init__(portfolio)
+        self.open = open_
+
+    def is_market_open(self) -> bool:
+        return self.open
 
 
 class TestProductionGuards:
@@ -182,6 +195,111 @@ class TestProductionGuards:
         assert info["market_closed"]
         assert not info["has_position"]
         assert broker.portfolio.cash == pytest.approx(100_000.0)
+
+    def test_decision_survives_a_closed_market_until_it_opens(self):
+        """Con velas diarias, la vela nueva aparece siempre con el mercado
+        cerrado: la decisión NO debe consumirse hasta poder ejecutarse."""
+        from trading_agent.env import Action
+        from trading_agent.portfolio import Portfolio
+
+        broker = ToggleMarketBroker(Portfolio(cash=100_000.0), open_=False)
+        trader = make_forced_trader(Action.BUY, broker=broker)
+        info = trader.run_once()                 # mercado cerrado
+        assert info["market_closed"] and not info["has_position"]
+        assert trader._last_decided_bar is None  # no consumida
+        broker.open = True
+        info = trader.run_once()                 # misma vela, mercado abierto
+        assert not info["stale_bar"] and info["has_position"]
+        assert trader.agent.calls == 2           # se volvió a decidir
+        assert trader._last_decided_bar is not None
+
+    def test_order_failure_does_not_consume_the_decision(self):
+        from trading_agent.env import Action
+        from trading_agent.portfolio import Portfolio
+
+        class FlakyBroker(PaperBroker):
+            def __init__(self, portfolio):
+                super().__init__(portfolio)
+                self.fail_next = True
+
+            def open_position(self, symbol, quantity, price_hint, *, tag=None):
+                if self.fail_next:
+                    self.fail_next = False
+                    from trading_agent.exceptions import ExecutionError
+                    raise ExecutionError("broker caído")
+                return super().open_position(symbol, quantity, price_hint, tag=tag)
+
+        broker = FlakyBroker(Portfolio(cash=100_000.0))
+        trader = make_forced_trader(Action.BUY, broker=broker)
+        from trading_agent.exceptions import ExecutionError
+        with pytest.raises(ExecutionError):
+            trader.run_once()
+        assert trader._last_decided_bar is None
+        info = trader.run_once()                 # reintento en la misma vela
+        assert info["has_position"]
+
+    def test_daily_baseline_is_previous_bar_equity(self):
+        """El límite diario se arma con el equity de la vela ANTERIOR (como
+        el entorno): armarlo con el actual lo compararía consigo mismo."""
+        from trading_agent.env import Action
+
+        df1 = make_ohlcv(200)
+        base = make_trader()
+        provider = FakeProvider(base.config.data, df=df1)
+        trader = make_forced_trader(Action.BUY, provider=provider)
+        info1 = trader.run_once()                # compra en la vela 1
+        assert info1["has_position"]
+        # Vela siguiente (día nuevo) con un precio distinto.
+        extra = df1.iloc[[-1]].copy()
+        extra.index = [df1.index[-1] + pd.Timedelta(days=1)]
+        extra["close"] = extra["close"] * 1.10
+        provider.df = pd.concat([df1, extra])
+        info2 = trader.run_once()
+        assert trader.risk.day_start_equity == pytest.approx(100_000.0)
+        assert info2["equity"] != pytest.approx(trader.risk.day_start_equity)
+
+    def test_restart_keeps_the_day_baseline_for_real_brokers(self, tmp_path):
+        """Reiniciar dentro de la misma jornada no rearma el límite diario
+        con el equity ya deteriorado."""
+        from trading_agent.env import Action
+        from trading_agent.portfolio import Portfolio
+
+        class RealLikeBroker(PaperBroker):
+            def sync(self, symbols=None):
+                return None
+
+        df = make_ohlcv(200)
+        base = make_trader()
+        provider = FakeProvider(base.config.data, df=df)
+        last_completed = df.index[-1].date()
+        path = tmp_path / "risk_state.json"
+        path.write_text(json.dumps({
+            "peak_equity": 100_000.0, "day_start_equity": 90_000.0,
+            "halted": False, "cooldown_remaining": 0,
+            "last_bar_date": last_completed.isoformat(),
+            "last_bar_equity": 90_000.0}))
+        trader = make_forced_trader(Action.HOLD, provider=provider,
+                                    broker=RealLikeBroker(Portfolio(cash=97_000.0)),
+                                    risk_state_path=path)
+        trader.run_once()
+        assert trader.risk.day_start_equity == pytest.approx(90_000.0)
+
+    def test_cooldown_blocks_reentry_on_the_stop_bar_like_the_env(self):
+        """cooldown_bars=1 debe bloquear la decisión de la misma vela en la
+        que saltó el stop (antes el decremento ocurría antes de decidir)."""
+        from trading_agent.config import RiskConfig
+        from trading_agent.env import Action
+        from trading_agent.portfolio import Portfolio, Position
+
+        broker = PaperBroker(Portfolio(cash=100_000.0))
+        broker.portfolio.positions["TEST"] = Position("TEST", 1, 1e9)  # muy perdedora
+        trader = make_forced_trader(
+            Action.BUY, broker=broker,
+            risk=RiskConfig(cooldown_bars=1, stop_loss_pct=0.05))
+        info = trader.run_once()
+        assert info["forced_close"] == "stop_loss"
+        assert not info["has_position"]            # recompra vetada
+        assert trader.risk.cooldown_remaining == 1
 
     def test_forced_close_waits_for_market_open(self):
         from trading_agent.env import Action

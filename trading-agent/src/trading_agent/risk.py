@@ -210,16 +210,18 @@ class RiskManager:
             vela, prevalece el stop-loss (supuesto conservador).
         """
         stop_price = position.entry_price * (1.0 - self.config.stop_loss_pct)
+        tp_price = (position.entry_price * (1.0 + self.config.take_profit_pct)
+                    if self.config.take_profit_pct is not None else None)
+        # Primero los huecos de apertura: lo que ya se cruzó al abrir se
+        # ejecutó al abrir, antes de cualquier recorrido intrabarra.
         if open_ <= stop_price:
             return "stop_loss", open_
+        if tp_price is not None and open_ >= tp_price:
+            return "take_profit", open_
         if low <= stop_price:
             return "stop_loss", stop_price
-        if self.config.take_profit_pct is not None:
-            tp_price = position.entry_price * (1.0 + self.config.take_profit_pct)
-            if open_ >= tp_price:
-                return "take_profit", open_
-            if high >= tp_price:
-                return "take_profit", tp_price
+        if tp_price is not None and high >= tp_price:
+            return "take_profit", tp_price
         return None, close
 
     def should_force_close(self, position: Position, price: float) -> str | None:

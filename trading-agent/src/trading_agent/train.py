@@ -30,6 +30,7 @@ from .data.provider import make_provider
 from .env import TradingEnvironment
 from .exceptions import TradingAgentError
 from .features import FEATURE_COLUMNS, build_features
+from .metrics import PERIODS_PER_YEAR
 
 
 def checkpoint_metadata(config: AppConfig, symbol: str) -> dict[str, object]:
@@ -204,12 +205,13 @@ def train(config: AppConfig, *, episodes: int = 50,
     # fuga) y luego split temporal: cada tramo conserva su calentamiento.
     features = build_features(ohlcv)
     train_df, val_df, test_df = three_way_split(ohlcv)
+    ppy = PERIODS_PER_YEAR.get(config.data.interval, 252)
     train_env = TradingEnvironment(train_df, config.env, config.risk, symbol,
-                                   features=features)
+                                   features=features, periods_per_year=ppy)
     val_env = TradingEnvironment(val_df, config.env, config.risk, symbol,
-                                 features=features)
+                                 features=features, periods_per_year=ppy)
     test_env = TradingEnvironment(test_df, config.env, config.risk, symbol,
-                                  features=features)
+                                  features=features, periods_per_year=ppy)
     checkpoint_meta = checkpoint_metadata(config, symbol)
 
     # El state_dim real depende de window_size y nº de features: se fija

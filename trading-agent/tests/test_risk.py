@@ -100,6 +100,15 @@ class TestIntrabarEvaluation:
                                        close=108.0)
         assert reason == "take_profit" and fill == pytest.approx(110.0)
 
+    def test_gap_up_through_take_profit_fills_at_open_before_intrabar_stop(self):
+        """Si la vela ya abre por encima del TP, se ejecutó al abrir: un
+        mínimo posterior bajo el stop ya no afecta a esa posición."""
+        rm = make_rm(stop_loss_pct=0.05, take_profit_pct=0.10)
+        pos = Position("AAPL", 10, entry_price=100.0)
+        reason, fill = rm.evaluate_bar(pos, open_=112.0, high=113.0, low=90.0,
+                                       close=95.0)
+        assert reason == "take_profit" and fill == pytest.approx(112.0)
+
     def test_stop_prevails_when_both_hit(self):
         rm = make_rm(stop_loss_pct=0.05, take_profit_pct=0.10)
         pos = Position("AAPL", 10, entry_price=100.0)

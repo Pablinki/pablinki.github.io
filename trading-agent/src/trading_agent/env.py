@@ -103,7 +103,8 @@ class TradingEnvironment:
 
     def __init__(self, ohlcv: pd.DataFrame, env_config: EnvConfig,
                  risk_config: RiskConfig, symbol: str = "ASSET",
-                 features: pd.DataFrame | None = None) -> None:
+                 features: pd.DataFrame | None = None,
+                 periods_per_year: int = 252) -> None:
         """
         Args:
             ohlcv: DataFrame OHLCV canónico con histórico suficiente
@@ -117,12 +118,15 @@ class TradingEnvironment:
                 cada tramo pierda su calentamiento ni arranque con EMAs
                 transitorias. Los indicadores son causales (solo usan el
                 pasado), así que no introduce fuga de información.
+            periods_per_year: velas por año para anualizar el Sharpe (252
+                para velas diarias; ver ``metrics.PERIODS_PER_YEAR``).
 
         Raises:
             DataValidationError: si el histórico es demasiado corto.
         """
         self.symbol = symbol
         self.env_config = env_config
+        self.periods_per_year = periods_per_year
         self.risk = RiskManager(risk_config)
 
         if features is None:
@@ -343,8 +347,8 @@ class TradingEnvironment:
                   sobre el mismo tramo de precios (del primer paso al actual).
                 - ``excess_return_pct``: ``total_return_pct`` menos el benchmark.
                 - ``max_drawdown_pct``: peor caída desde un pico, en [0, 1].
-                - ``sharpe``: ratio de Sharpe anualizado asumiendo 252 velas
-                  por año (válido para velas diarias; reescalar si no).
+                - ``sharpe``: ratio de Sharpe anualizado con
+                  ``periods_per_year`` velas por año (252 en velas diarias).
                 - ``profit_factor``: ganancias brutas / pérdidas brutas.
                 - ``n_trades``: nº de operaciones (compras + ventas).
                 - ``win_rate``: fracción de ventas con P&L > 0.
@@ -364,7 +368,8 @@ class TradingEnvironment:
             "buy_and_hold_return_pct": buy_and_hold,
             "excess_return_pct": total_return - buy_and_hold,
             "max_drawdown_pct": max_drawdown(self._equity_curve),
-            "sharpe": sharpe_ratio(self._equity_curve),
+            "sharpe": sharpe_ratio(self._equity_curve,
+                                   periods_per_year=self.periods_per_year),
             "profit_factor": profit_factor(self._portfolio.trades),
             "n_trades": float(len(self._portfolio.trades)),
             "win_rate": wins / len(sells) if sells else 0.0,

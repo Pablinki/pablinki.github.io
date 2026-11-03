@@ -72,11 +72,18 @@ class TestRateLimit:
 
         calls = {"n": 0}
 
-        def fake_download(**kwargs):
-            calls["n"] += 1
-            raise YFRateLimitError("Too Many Requests")
+        class FakeTicker:
+            def __init__(self, symbol):
+                self.symbol = symbol
 
-        fake_yf = types.SimpleNamespace(download=fake_download)
+            def history(self, **kwargs):
+                # El adaptador DEBE pedir raise_errors=True: yf.download y
+                # history() sin él tragan el error y devuelven vacío.
+                assert kwargs.get("raise_errors") is True
+                calls["n"] += 1
+                raise YFRateLimitError("Too Many Requests")
+
+        fake_yf = types.SimpleNamespace(Ticker=FakeTicker)
         monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
         provider = YahooFinanceProvider(DataConfig(cache_dir=None, max_retries=3,
                                                    retry_backoff_s=0.0))

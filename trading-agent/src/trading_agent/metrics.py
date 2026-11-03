@@ -30,6 +30,10 @@ from collections.abc import Sequence
 
 from .portfolio import Trade
 
+#: Velas por año según el intervalo (sesión de EE. UU.: 252 días, 6,5 h).
+PERIODS_PER_YEAR = {"1d": 252, "1h": 252 * 7, "30m": 252 * 13,
+                    "15m": 252 * 26, "5m": 252 * 78, "1m": 252 * 390}
+
 
 def max_drawdown(equity_curve: Sequence[float]) -> float:
     """Máxima caída desde un pico histórico, como fracción del pico.

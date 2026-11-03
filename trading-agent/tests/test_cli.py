@@ -53,6 +53,14 @@ class TestHealthcheck:
         bad.write_text("{no json")
         assert hc.check(bad, max_age_s=1, max_errors=1)[0] is False
 
+    def test_naive_timestamp_is_tolerated(self, tmp_path):
+        hc = self._load()
+        path = tmp_path / "heartbeat.json"
+        naive_now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        self._write(path, utc=naive_now.isoformat())
+        ok, _ = hc.check(path, max_age_s=300, max_errors=3)
+        assert ok is True
+
     def test_kill_switch_and_errors_are_unhealthy(self, tmp_path):
         hc = self._load()
         path = tmp_path / "heartbeat.json"

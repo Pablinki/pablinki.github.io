@@ -96,17 +96,17 @@ class YahooFinanceProvider(DataProvider):
         kwargs: dict = {"period": period} if period is not None \
             else {"start": start, "end": end}
         try:
-            raw = yf.download(
-                tickers=symbol,
+            # Ticker.history con raise_errors=True PROPAGA los errores de
+            # Yahoo (yf.download los traga y devuelve un DataFrame vacío, lo
+            # que convertiría un rate limit en reintentos inútiles).
+            raw = yf.Ticker(symbol).history(
                 interval=self.config.interval,
                 auto_adjust=True,     # precios ajustados por splits/dividendos
-                progress=False,
-                threads=False,
+                raise_errors=True,
                 **kwargs,
             )
         except Exception as exc:
-            # yfinance lanza YFRateLimitError al superar la cuota de Yahoo;
-            # insistir con backoff corto solo alarga el bloqueo.
+            # YFRateLimitError: insistir con backoff corto alarga el bloqueo.
             if "ratelimit" in type(exc).__name__.lower():
                 raise RateLimitError(
                     f"Yahoo Finance limitó la tasa para {symbol!r}: {exc}"
@@ -114,7 +114,7 @@ class YahooFinanceProvider(DataProvider):
             raise
         if raw is None or raw.empty:
             raise DataProviderError(f"yfinance devolvió vacío para {symbol!r}")
-        # yfinance puede devolver columnas MultiIndex (precio, ticker).
+        # Algunas versiones devuelven columnas MultiIndex (precio, ticker).
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
         return validate_ohlcv(raw, symbol)

@@ -1,6 +1,7 @@
 # Despliegue del trading agent con Docker Compose.
 #
 #   cp .env.example .env   # y rellena las claves (NUNCA se suben al repo)
+#   mkdir -p logs .cache checkpoints   # creados por TU usuario, no por root
 #   docker compose up -d --build
 #   docker compose logs -f trader
 #   docker compose stop     # SIGTERM -> parada limpia con liquidación
@@ -16,6 +17,10 @@ services:
     image: trading-agent:latest
     restart: on-failure:5
     stop_grace_period: 120s      # tiempo para liquidar antes de SIGKILL
+    # El contenedor corre como TU usuario: así puede escribir en los bind
+    # mounts (logs/, .cache/) sin que Docker los cree como root.
+    # Exporta UID y GID antes (`export UID GID=$(id -g)`) o deja 1000:1000.
+    user: "${UID:-1000}:${GID:-1000}"
     env_file:
       - .env                     # ALPACA_API_KEY, ALPACA_SECRET_KEY, ...
     volumes:

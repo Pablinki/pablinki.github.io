@@ -34,6 +34,14 @@ class TestValidateOhlcv:
         assert len(out) == len(ohlcv) - 1
         assert "corrupta" in caplog.text
 
+    def test_corrupt_newest_bar_is_never_dropped_silently(self, ohlcv):
+        """La última vela fija precio, stops y órdenes: si está corrupta el
+        ciclo debe saltarse, no operar con el cierre anterior."""
+        bad = ohlcv.copy()
+        bad.iloc[-1, bad.columns.get_loc("close")] = -1.0
+        with pytest.raises(DataValidationError, match="más reciente"):
+            validate_ohlcv(bad, "TEST")
+
     def test_widespread_bad_prices_raise(self, ohlcv):
         bad = ohlcv.copy()
         bad.iloc[:10, bad.columns.get_loc("close")] = -1.0   # 10 de 400 > 1%

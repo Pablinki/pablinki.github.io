@@ -101,6 +101,12 @@ def validate_ohlcv(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
            | (df["volume"] < 0))
     n_bad = int(bad.sum())
     if n_bad:
+        if bool(bad.iloc[-1]):
+            # La última vela es la que fija precio, stops y órdenes: si está
+            # corrupta no hay precio fiable y el ciclo debe saltarse.
+            raise DataValidationError(
+                f"{symbol}: la vela más reciente tiene precios <= 0 o volumen "
+                "negativo")
         if n_bad > max(1, len(df) // 100):
             raise DataValidationError(
                 f"{symbol}: {n_bad} velas con precios <= 0 o volumen negativo")

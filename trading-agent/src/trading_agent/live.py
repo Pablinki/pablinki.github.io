@@ -124,8 +124,10 @@ class LiveTrader:
         # Evento de parada: la señal lo activa y el bucle despierta al
         # instante en vez de agotar la espera entre iteraciones.
         self._stop_event = threading.Event()
-        self._last_bar_date = None      # arma el límite de pérdida diaria
+        self._last_bar_date: dt.date | None = None  # límite de pérdida diaria
         self._last_decided_bar = None   # el agente decide UNA vez por vela
+        self._last_seen_bar = None      # avance del enfriamiento por vela
+        self._last_bar_equity: float | None = None  # baseline del día siguiente
         self._last_price: float | None = None  # para liquidar sin red
         self._load_risk_state()  # tras conocer el broker (ver método)
 
@@ -158,7 +160,7 @@ class LiveTrader:
         }
         try:
             self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.heartbeat_path.with_suffix(".tmp")
+            tmp = self.heartbeat_path.with_name(self.heartbeat_path.name + ".tmp")
             tmp.write_text(json.dumps(payload), encoding="utf-8")
             tmp.replace(self.heartbeat_path)
         except OSError as exc:
@@ -193,6 +195,15 @@ class LiveTrader:
             # kill-switch y el enfriamiento.
             self.risk.peak_equity = None
             self.risk.day_start_equity = None
+        else:
+            # Broker real: la jornada y su baseline sobreviven al reinicio;
+            # si no, el primer sondeo rearmaría el límite diario con el
+            # equity ya deteriorado y cada reinicio "regalaría" otro 3%.
+            if state.get("last_bar_date"):
+                self._last_bar_date = dt.date.fromisoformat(
+                    str(state["last_bar_date"]))
+            if state.get("last_bar_equity") is not None:
+                self._last_bar_equity = float(state["last_bar_equity"])
         logger.info("Estado de riesgo restaurado desde %s: %s",
                     self.risk_state_path, self.risk.to_dict())
         if self.risk.halted:
@@ -205,10 +216,18 @@ class LiveTrader:
         """Persiste el RiskManager a disco (escritura atómica)."""
         if self.risk_state_path is None:
             return
+        state = {
+            **self.risk.to_dict(),
+            "last_bar_date": (self._last_bar_date.isoformat()
+                              if self._last_bar_date is not None else None),
+            "last_bar_equity": self._last_bar_equity,
+        }
         try:
             self.risk_state_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.risk_state_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.risk.to_dict()), encoding="utf-8")
+            # Sufijo propio: heartbeat.json/.tmp y risk_state.json/.tmp no
+            # deben pisarse en la misma carpeta.
+            tmp = self.risk_state_path.with_name(self.risk_state_path.name + ".tmp")
+            tmp.write_text(json.dumps(state), encoding="utf-8")
             tmp.replace(self.risk_state_path)
         except OSError as exc:
             logger.error("No se pudo guardar el estado de riesgo en %s: %s",
@@ -321,14 +340,31 @@ class LiveTrader:
         equity = self.portfolio.equity({self.symbol: price})
         self.risk.update_equity(equity)
 
-        # Nueva jornada (fecha de la última vela): arma el límite de
-        # pérdida diaria con el equity de apertura del día.
+        # Vela nueva para el agente. Se detecta aquí, pero solo se marca como
+        # DECIDIDA al final, cuando la orden pudo ejecutarse: si el mercado
+        # está cerrado (con velas diarias, siempre que la vela se completa)
+        # o la orden falla, el próximo sondeo vuelve a decidir sobre la
+        # misma vela en vez de perder la decisión.
+        new_bar = bar_ts != self._last_decided_bar
+        prev_bar_equity = self._last_bar_equity
+        if bar_ts != self._last_seen_bar:
+            # Igual que env.step: el enfriamiento avanza una vez por vela,
+            # ANTES de evaluar los stops y de que el agente decida.
+            self.risk.new_bar()
+            self._last_seen_bar = bar_ts
+            self._last_bar_equity = equity
+
+        # Nueva jornada (fecha de la última vela): el límite de pérdida
+        # diaria se arma con el equity de la vela ANTERIOR, como en el
+        # entorno. Armarlo con el equity actual lo compararía consigo mismo
+        # en este mismo ciclo y nunca vetaría nada.
         bar_date = bar_ts.date()
         if bar_date != self._last_bar_date:
             if self._last_bar_date is not None:
                 self._reconcile_with_broker()
                 equity = self.portfolio.equity({self.symbol: price})
-            self.risk.start_new_day(equity)
+            self.risk.start_new_day(
+                prev_bar_equity if prev_bar_equity is not None else equity)
             self._last_bar_date = bar_date
 
         market_open = self.broker.is_market_open()
@@ -353,17 +389,18 @@ class LiveTrader:
                                self.symbol, reason)
 
         # (4) Decisión del agente (greedy), solo ante una vela nueva.
-        stale_bar = bar_ts == self._last_decided_bar
-        if stale_bar:
-            action = Action.HOLD
-        else:
-            self.risk.new_bar()  # consume el enfriamiento tras un stop
+        if new_bar:
             state = self._build_state(feats, price)
             action = Action(self.agent.act(state, greedy=True))
-            self._last_decided_bar = bar_ts
+        else:
+            action = Action.HOLD
 
         if not market_open:
-            pass  # sin órdenes: la decisión se re-evaluará con la vela siguiente
+            # Sin órdenes y SIN marcar la vela como decidida: se volverá a
+            # decidir sobre ella en el primer sondeo con mercado abierto.
+            if new_bar and action != Action.HOLD:
+                logger.info("%s: decisión %s pendiente hasta apertura de mercado",
+                            self.symbol, action.name)
         elif action == Action.BUY and not self.portfolio.has_position(self.symbol):
             if self.risk.can_open(equity):
                 qty = self.risk.position_size(equity, price)
@@ -391,6 +428,12 @@ class LiveTrader:
             logger.info("%s: VENTA %g @ %.2f, P&L %.2f USD",
                         self.symbol, trade.quantity, price, trade.pnl)
 
+        if market_open and new_bar:
+            # Solo ahora cuenta como decidida: si la orden hubiera fallado,
+            # la excepción habría salido antes y el próximo sondeo
+            # reintentaría esta misma vela.
+            self._last_decided_bar = bar_ts
+
         equity = self.portfolio.equity({self.symbol: price})
         self._save_risk_state()
         return {
@@ -399,7 +442,7 @@ class LiveTrader:
             "equity": equity,
             "has_position": self.portfolio.has_position(self.symbol),
             "forced_close": forced_close,
-            "stale_bar": stale_bar,
+            "stale_bar": not new_bar,
             "market_closed": not market_open,
         }
 

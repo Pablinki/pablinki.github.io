@@ -28,12 +28,15 @@ El cliente HTTP es inyectable (cualquier objeto con la interfaz de
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import logging
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
-from ..exceptions import ExecutionError
-from ..portfolio import Portfolio, Trade
+from ..exceptions import ExecutionError, SecurityError
+from ..portfolio import Portfolio, Position, Trade
 from ..security import assert_live_trading_allowed, get_secret
 from .base import BrokerAdapter
 
@@ -41,6 +44,9 @@ logger = logging.getLogger(__name__)
 
 #: URL del entorno paper (dinero ficticio). Es el defecto deliberadamente.
 PAPER_URL = "https://paper-api.alpaca.markets"
+
+#: Únicos hosts a los que se envían las credenciales.
+ALLOWED_HOSTS = frozenset({"paper-api.alpaca.markets", "api.alpaca.markets"})
 
 #: Estados terminales de una orden que significan "no se ejecutó".
 _FAILED_STATES = frozenset({"canceled", "expired", "rejected", "suspended",
@@ -57,6 +63,8 @@ class AlpacaBroker(BrokerAdapter):
             uno real (inyectable en tests).
         order_timeout_s: segundos máximos esperando el fill de una orden.
         poll_interval_s: segundos entre sondeos del estado de la orden.
+        cancel_wait_s: segundos máximos esperando a que una cancelación
+            (asíncrona en Alpaca) llegue a estado terminal.
 
     Raises:
         SecurityError: si faltan credenciales, o si la URL apunta al
@@ -66,7 +74,8 @@ class AlpacaBroker(BrokerAdapter):
 
     def __init__(self, portfolio: Portfolio, *, session: Any = None,
                  order_timeout_s: float = 30.0,
-                 poll_interval_s: float = 0.5) -> None:
+                 poll_interval_s: float = 0.5,
+                 cancel_wait_s: float = 10.0) -> None:
         super().__init__(portfolio)
         if portfolio.commission_pct != 0.0 or portfolio.slippage_pct != 0.0:
             raise ExecutionError(
@@ -78,7 +87,23 @@ class AlpacaBroker(BrokerAdapter):
         secret = get_secret("ALPACA_SECRET_KEY")
         self.base_url = (get_secret("ALPACA_BASE_URL", required=False)
                          or PAPER_URL).rstrip("/")
-        self.is_paper = self.base_url == PAPER_URL
+        parts = urlsplit(self.base_url)
+        # Las credenciales viajan en cabeceras: solo TLS y solo hacia hosts
+        # de Alpaca (sin usuario:clave, parámetros ni fragmentos en la URL).
+        if (parts.scheme != "https" or parts.username or parts.password
+                or parts.query or parts.fragment):
+            raise SecurityError(
+                "ALPACA_BASE_URL debe ser https:// sin credenciales ni "
+                f"parámetros, no {parts.hostname!r}")
+        if parts.hostname not in ALLOWED_HOSTS:
+            raise SecurityError(
+                f"Host {parts.hostname!r} no permitido para ALPACA_BASE_URL; "
+                f"use uno de {sorted(ALLOWED_HOSTS)}")
+        self.host = parts.hostname
+        # Paper vs real se decide por el host validado (no por igualdad
+        # textual de la URL: mayúsculas o un puerto explícito no cambian el
+        # entorno al que se habla).
+        self.is_paper = parts.hostname == "paper-api.alpaca.markets"
         if not self.is_paper:
             # Dinero real: exige la habilitación consciente del operador.
             assert_live_trading_allowed()
@@ -97,6 +122,20 @@ class AlpacaBroker(BrokerAdapter):
         })
         self.order_timeout_s = order_timeout_s
         self.poll_interval_s = poll_interval_s
+        self.cancel_wait_s = cancel_wait_s
+        self._last_order_id: str | None = None
+        self._last_client_order_id: str | None = None
+        # Idempotencia por intento: cada decisión (símbolo, lado, vela) lleva
+        # un contador de intentos que avanza solo tras un desenlace
+        # terminal; un reintento por fallo de red reutiliza el mismo id y
+        # recupera la orden, un reintento tras rechazo/parcial envía una
+        # orden NUEVA. El prefijo por proceso evita recuperar órdenes
+        # históricas tras un reinicio (sync() ya refleja sus fills).
+        self._run_id = f"{int(time.time() * 1000):x}"[-6:]
+        self._attempts: dict[str, int] = {}
+        self._attempt_keys: dict[str, str] = {}  # client_order_id -> clave
+        self._accounted: set[str] = set()  # ids de orden ya reflejados
+        self._symbols: tuple[str, ...] | None = None
 
     # ------------------------------------------------------------------ #
     # HTTP                                                               #
@@ -119,14 +158,23 @@ class AlpacaBroker(BrokerAdapter):
         """
         url = f"{self.base_url}{path}"
         try:
-            resp = self._session.request(method, url, json=json, timeout=15)
+            # Sin seguir redirecciones: las cabeceras con credenciales no
+            # deben viajar a un host distinto del verificado.
+            resp = self._session.request(method, url, json=json, timeout=15,
+                                         allow_redirects=False)
         except Exception as exc:
-            raise ExecutionError(f"Fallo de red hacia Alpaca ({path}): {exc}"
-                                 ) from exc
+            raise ExecutionError(f"Fallo de red hacia {self.host} ({path}): "
+                                 f"{type(exc).__name__}") from exc
+        if 300 <= resp.status_code < 400:
+            raise ExecutionError(
+                f"Alpaca intentó redirigir {path} ({resp.status_code}); "
+                "rechazado por seguridad")
         if resp.status_code not in ok_status:
             raise ExecutionError(
                 f"Alpaca respondió {resp.status_code} en {path}: "
                 f"{resp.text[:300]}")
+        if resp.status_code == 204 or not getattr(resp, "content", b"x"):
+            return {}  # sin cuerpo (p. ej. DELETE aceptado)
         try:
             return resp.json()
         except ValueError as exc:
@@ -157,6 +205,70 @@ class AlpacaBroker(BrokerAdapter):
         logger.info("Efectivo sincronizado con Alpaca: %.2f USD",
                     self.portfolio.cash)
 
+    def sync_positions(self, symbols: tuple[str, ...] | None = None) -> None:
+        """Refleja en el espejo las posiciones largas abiertas en Alpaca.
+
+        Imprescindible tras un reinicio del proceso: sin esto, una
+        posición real abierta sería invisible para el RiskManager (sin
+        stop-loss) y el agente podría comprar de nuevo encima.
+
+        Args:
+            symbols: si se indica, solo se reflejan estas posiciones; las
+                de otros símbolos (otro proceso, operaciones manuales) se
+                registran con aviso y se ignoran — meterlas en el espejo
+                rompería la valoración del equity de este proceso.
+
+        Raises:
+            ExecutionError: si la API falla o hay una posición corta en
+                un símbolo operado (este sistema solo opera en largo).
+        """
+        raw = self._request("GET", "/v2/positions")
+        if not isinstance(raw, list):
+            raise ExecutionError("Respuesta inesperada de /v2/positions")
+        # Se construye y valida aparte: si algo falla, el espejo anterior
+        # queda intacto en vez de medio borrado.
+        mirrored: dict[str, Position] = {}
+        for p in raw:
+            symbol = p.get("symbol", "?")
+            if symbols is not None and symbol not in symbols:
+                logger.warning("Posición ajena en la cuenta ignorada: %s %s "
+                               "(este proceso opera %s)", symbol, p.get("qty"),
+                               ", ".join(symbols))
+                continue
+            qty = float(p["qty"])
+            if p.get("side", "long") != "long" or qty <= 0:
+                raise ExecutionError(
+                    f"Posición no soportada en {symbol}: "
+                    f"side={p.get('side')!r} qty={qty}")
+            mirrored[symbol] = Position(symbol, qty, float(p["avg_entry_price"]))
+            logger.info("Posición sincronizada desde Alpaca: %s %g @ %.4f",
+                        symbol, qty, float(p["avg_entry_price"]))
+        self.portfolio.positions.clear()
+        self.portfolio.positions.update(mirrored)
+
+    def sync(self, symbols: tuple[str, ...] | None = None) -> None:
+        """Sincroniza efectivo y posiciones (llamar al arrancar y cada día).
+
+        Args:
+            symbols: ver :meth:`sync_positions`.
+        """
+        self._symbols = symbols
+        self.sync_cash()
+        self.sync_positions(symbols)
+
+    def is_market_open(self) -> bool:
+        """Consulta el reloj de mercado de Alpaca (``GET /v2/clock``).
+
+        Returns:
+            ``True`` si el mercado está abierto. Ante un fallo de la API
+            devuelve ``False`` (no operar es la opción segura) y lo registra.
+        """
+        try:
+            return bool(self._request("GET", "/v2/clock").get("is_open", False))
+        except ExecutionError as exc:
+            logger.error("No se pudo consultar el reloj de mercado: %s", exc)
+            return False
+
     # ------------------------------------------------------------------ #
     # Órdenes                                                            #
     # ------------------------------------------------------------------ #
@@ -184,27 +296,90 @@ class AlpacaBroker(BrokerAdapter):
             if status == "filled":
                 return order
             if status in _FAILED_STATES:
+                if float(order.get("filled_qty") or 0) > 0:
+                    # Cancelada/expirada con fill parcial: las acciones
+                    # ejecutadas son reales y deben contabilizarse.
+                    logger.warning("Orden %s %s con fill parcial %s",
+                                   order_id, status, order.get("filled_qty"))
+                    return order
                 raise ExecutionError(
                     f"Orden {order_id} terminó en estado {status!r}")
             if time.monotonic() >= deadline:
-                try:  # best-effort: no dejar la orden viva
-                    self._request("DELETE", f"/v2/orders/{order_id}",
-                                  ok_status=(200, 204, 404, 422))
-                except ExecutionError:
-                    logger.error("No se pudo cancelar la orden %s tras el "
-                                 "timeout. REVISAR EN EL DASHBOARD.", order_id)
-                raise ExecutionError(
-                    f"Orden {order_id} sin fill tras {self.order_timeout_s}s "
-                    f"(último estado: {status!r})")
+                return self._cancel_and_reconcile(order_id, status)
             time.sleep(self.poll_interval_s)
 
-    def _market_order(self, symbol: str, side: str, qty: float) -> tuple[float, float]:
-        """Envía una orden market y espera su fill completo.
+    def _cancel_and_reconcile(self, order_id: str, last_status: str | None) -> dict:
+        """Cancela una orden colgada y recupera lo que SÍ se ejecutó.
+
+        Tras el timeout: ``DELETE`` (best-effort) y nueva lectura de la
+        orden. Si tiene ``filled_qty > 0`` se devuelve para que el espejo
+        contable refleje las acciones reales; si nada se ejecutó, se falla.
+
+        Args:
+            order_id: id de la orden.
+            last_status: último estado visto (solo para el mensaje).
+
+        Returns:
+            El JSON final de la orden con fill parcial.
+
+        Raises:
+            ExecutionError: si no se ejecutó ninguna acción.
+        """
+        try:
+            self._request("DELETE", f"/v2/orders/{order_id}",
+                          ok_status=(200, 204, 404, 422))
+        except ExecutionError:
+            logger.error("No se pudo cancelar la orden %s tras el timeout. "
+                         "REVISAR EN EL DASHBOARD.", order_id)
+        # La cancelación es ASÍNCRONA (pending_cancel): una orden market
+        # puede ejecutarse entre el DELETE y la confirmación. Solo un estado
+        # terminal dice cuántas acciones son reales.
+        deadline = time.monotonic() + self.cancel_wait_s
+        final: dict = {}
+        while True:
+            try:
+                final = self._request("GET", f"/v2/orders/{order_id}")
+            except ExecutionError:
+                final = {}
+            status = final.get("status")
+            if status == "filled" or status in _FAILED_STATES:
+                break
+            if time.monotonic() >= deadline:
+                logger.critical(
+                    "Orden %s sin estado terminal tras cancelar (%r). El "
+                    "espejo puede divergir: se re-sincroniza con la cuenta. "
+                    "REVISAR EN EL DASHBOARD.", order_id, status)
+                try:
+                    self.sync(self._symbols)
+                except ExecutionError as exc:
+                    logger.error("Re-sincronización fallida: %s", exc)
+                raise ExecutionError(
+                    f"Orden {order_id} en estado no terminal {status!r} tras "
+                    f"cancelar; espejo re-sincronizado")
+            time.sleep(self.poll_interval_s)
+        if float(final.get("filled_qty") or 0) > 0:
+            logger.warning("Orden %s %s tras timeout con fill %s @ %s",
+                           order_id, final.get("status"), final.get("filled_qty"),
+                           final.get("filled_avg_price"))
+            return final
+        raise ExecutionError(
+            f"Orden {order_id} sin fill tras {self.order_timeout_s}s "
+            f"(último estado: {last_status!r})")
+
+    def _market_order(self, symbol: str, side: str, qty: float,
+                      client_order_id: str | None = None) -> tuple[float, float]:
+        """Envía una orden market y espera su fill (total o parcial).
+
+        Idempotencia: con ``client_order_id`` Alpaca rechaza un duplicado
+        (HTTP 422). Si eso ocurre, la orden ya fue enviada en un intento
+        anterior (p. ej. el proceso murió tras el POST): se recupera por
+        su id de cliente y se espera su fill en vez de duplicar la compra.
 
         Args:
             symbol: ticker.
             side: ``"buy"`` o ``"sell"``.
             qty: nº de acciones (entero positivo).
+            client_order_id: id determinista por decisión (opcional).
 
         Returns:
             Tupla ``(filled_qty, filled_avg_price)`` del fill real.
@@ -212,46 +387,142 @@ class AlpacaBroker(BrokerAdapter):
         if qty <= 0 or qty != int(qty):
             raise ExecutionError(
                 f"Cantidad inválida para Alpaca: {qty!r} (entero > 0)")
-        order = self._request("POST", "/v2/orders", json={
+        body = {
             "symbol": symbol,
             "qty": str(int(qty)),
             "side": side,
             "type": "market",
             "time_in_force": "day",
-        })
-        filled = self._await_fill(order["id"])
-        return float(filled["filled_qty"]), float(filled["filled_avg_price"])
+        }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        try:
+            order = self._request("POST", "/v2/orders", json=body)
+        except ExecutionError as exc:
+            if client_order_id and "422" in str(exc) and "client_order_id" in str(exc):
+                logger.warning("Orden %s ya existía en Alpaca: se recupera en "
+                               "vez de duplicarla", client_order_id)
+                order = self._request(
+                    "GET", "/v2/orders:by_client_order_id"
+                           f"?client_order_id={client_order_id}")
+                if str(order.get("id")) in self._accounted:
+                    # Ya reflejada en el espejo: repetirla duplicaría la
+                    # contabilidad. Un nuevo intento usará otro id.
+                    self._bump_attempt(client_order_id)
+                    raise ExecutionError(
+                        f"Orden {client_order_id} ya contabilizada; no se "
+                        "repite") from exc
+            else:
+                raise  # fallo de red: el mismo id recuperará la orden
+        try:
+            filled = self._await_fill(order["id"])
+        except ExecutionError:
+            self._bump_attempt(client_order_id)  # desenlace terminal sin fill
+            raise
+        filled_qty = float(filled["filled_qty"])
+        if filled_qty <= 0:
+            self._bump_attempt(client_order_id)
+            raise ExecutionError(f"Orden {order['id']} sin acciones ejecutadas")
+        self._last_order_id = str(order["id"])
+        self._last_client_order_id = client_order_id
+        self._accounted.add(self._last_order_id)
+        self._bump_attempt(client_order_id)  # el siguiente intento es nuevo
+        return filled_qty, float(filled["filled_avg_price"])
+
+    def _bump_attempt(self, client_order_id: str | None) -> None:
+        """Avanza el contador de intentos de la decisión de ese id."""
+        if client_order_id and client_order_id in self._attempt_keys:
+            key = self._attempt_keys.pop(client_order_id)
+            self._attempts[key] = self._attempts.get(key, 0) + 1
+
+    def _tag_trade(self, trade: Trade) -> Trade:
+        """Devuelve el trade con los ids de orden del último fill y lo
+        sustituye en el historial del portafolio (Trade es inmutable)."""
+        tagged = dataclasses.replace(
+            trade, order_id=self._last_order_id,
+            client_order_id=self._last_client_order_id)
+        if self.portfolio.trades and self.portfolio.trades[-1] is trade:
+            self.portfolio.trades[-1] = tagged
+        return tagged
+
+    def _client_order_id(self, symbol: str, side: str, tag: str | None) -> str | None:
+        """Id de cliente idempotente por (proceso, decisión, intento).
+
+        Formato ``{run}-{símbolo}-{b|s}-{hash10(tag)}-{intento}`` (≤ 40
+        caracteres). El hash evita colisiones por truncado; el intento
+        avanza solo tras un desenlace terminal (ver :meth:`_market_order`).
+
+        Args:
+            symbol: ticker.
+            side: ``"buy"`` o ``"sell"``.
+            tag: identificador de la decisión (vela [+ motivo]).
+
+        Returns:
+            El id, o ``None`` si no hay tag (orden sin idempotencia).
+        """
+        if not tag:
+            return None
+        key = f"{symbol}-{side}-{tag}"
+        digest = hashlib.sha1(tag.encode("utf-8")).hexdigest()[:10]
+        attempt = self._attempts.get(key, 0)
+        cid = f"{self._run_id}-{symbol}-{side[0]}-{digest}-{attempt}"
+        self._attempt_keys[cid] = key
+        return cid
 
     # ------------------------------------------------------------------ #
     # Interfaz BrokerAdapter                                             #
     # ------------------------------------------------------------------ #
     def open_position(self, symbol: str, quantity: float,
-                      price_hint: float) -> Trade:
+                      price_hint: float, *, tag: str | None = None) -> Trade:
         """Compra a mercado y refleja el fill real en el portafolio local.
 
         Ver contrato en :meth:`BrokerAdapter.open_position`. ``price_hint``
         solo se usa para registrar la desviación del fill en el log.
         """
-        filled_qty, fill_price = self._market_order(symbol, "buy", quantity)
+        filled_qty, fill_price = self._market_order(
+            symbol, "buy", quantity,
+            client_order_id=self._client_order_id(symbol, "buy", tag))
+        if filled_qty != quantity:
+            logger.warning("Fill parcial en compra %s: %g de %g", symbol,
+                           filled_qty, quantity)
         logger.info("Alpaca BUY %s: %g @ %.4f (referencia %.4f, desvío %+.2f%%)",
                     symbol, filled_qty, fill_price, price_hint,
                     (fill_price / price_hint - 1.0) * 100 if price_hint else 0.0)
-        # Espejo contable al precio real de ejecución (costes incluidos).
-        return self.portfolio.open_position(symbol, fill_price, filled_qty)
+        # Espejo contable al precio real de ejecución (costes incluidos). El
+        # fill YA ocurrió: se refleja aunque el efectivo local no cuadre
+        # (p. ej. fill por encima del margen) y se re-sincroniza después.
+        trade = self._tag_trade(self.portfolio.open_position(
+            symbol, fill_price, filled_qty, enforce_funds=False))
+        if self.portfolio.cash < 0:
+            logger.warning("Efectivo espejo negativo tras el fill (%.2f): "
+                           "re-sincronizando con la cuenta", self.portfolio.cash)
+            try:
+                self.sync_cash()
+            except ExecutionError as exc:
+                logger.error("No se pudo re-sincronizar el efectivo: %s", exc)
+        return trade
 
-    def close_position(self, symbol: str, price_hint: float) -> Trade:
+    def close_position(self, symbol: str, price_hint: float, *,
+                       tag: str | None = None) -> Trade:
         """Vende a mercado toda la posición y refleja el fill real.
+
+        Un fill parcial reduce la posición espejo por lo realmente vendido
+        (el resto sigue abierto y protegido por el RiskManager) y se
+        registra como error operativo.
 
         Ver contrato en :meth:`BrokerAdapter.close_position`.
         """
         pos = self.portfolio.positions.get(symbol)
         if pos is None:
             raise ExecutionError(f"No hay posición espejo abierta en {symbol}")
-        filled_qty, fill_price = self._market_order(symbol, "sell", pos.quantity)
+        filled_qty, fill_price = self._market_order(
+            symbol, "sell", pos.quantity,
+            client_order_id=self._client_order_id(symbol, "sell", tag))
         if filled_qty != pos.quantity:
-            logger.error("Fill parcial inesperado en %s: %g de %g. "
-                         "REVISAR EN EL DASHBOARD.", symbol, filled_qty,
-                         pos.quantity)
+            logger.error("Fill parcial en venta %s: %g de %g; el resto sigue "
+                         "abierto. REVISAR EN EL DASHBOARD.", symbol,
+                         filled_qty, pos.quantity)
         logger.info("Alpaca SELL %s: %g @ %.4f (referencia %.4f)",
                     symbol, filled_qty, fill_price, price_hint)
-        return self.portfolio.close_position(symbol, fill_price)
+        return self._tag_trade(
+            self.portfolio.reduce_position(symbol, fill_price, filled_qty))

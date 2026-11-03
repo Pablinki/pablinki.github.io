@@ -44,6 +44,8 @@ class Trade:
         price: precio de ejecución efectivo (ya incluye slippage).
         commission: comisión pagada en USD.
         pnl: ganancia/pérdida realizada en USD (solo en ventas; 0 en compras).
+        order_id: id de la orden en el broker (``None`` en simulación).
+        client_order_id: id de cliente idempotente enviado al broker.
     """
 
     symbol: str
@@ -52,6 +54,8 @@ class Trade:
     price: float
     commission: float
     pnl: float = 0.0
+    order_id: str | None = None
+    client_order_id: str | None = None
 
 
 @dataclass
@@ -67,6 +71,7 @@ class Position:
     symbol: str
     quantity: float
     entry_price: float
+    entry_commission: float = 0.0  # se descuenta del P&L realizado al cerrar
 
     def unrealized_pnl(self, price: float) -> float:
         """P&L no realizado a un precio de mercado dado.
@@ -140,7 +145,8 @@ class Portfolio:
     # ------------------------------------------------------------------ #
     # Operaciones                                                        #
     # ------------------------------------------------------------------ #
-    def open_position(self, symbol: str, price: float, quantity: float) -> Trade:
+    def open_position(self, symbol: str, price: float, quantity: float, *,
+                      enforce_funds: bool = True) -> Trade:
         """Abre una posición larga comprando ``quantity`` acciones.
 
         Aplica slippage adverso (compra a ``price * (1 + slippage_pct)``)
@@ -150,6 +156,10 @@ class Portfolio:
             symbol: ticker a comprar.
             price: precio de mercado de referencia (> 0).
             quantity: nº de acciones (> 0).
+            enforce_funds: si ``True`` (simulación) rechaza compras que no
+                caben en el efectivo. Un broker real lo pone en ``False``:
+                el fill ya ocurrió y el espejo debe reflejarlo aunque el
+                efectivo local quede desfasado (se re-sincroniza después).
 
         Returns:
             El :class:`Trade` de compra registrado.
@@ -158,7 +168,8 @@ class Portfolio:
             ExecutionError: si ya hay posición abierta en ``symbol`` (este
                 modelo mantiene como máximo una posición por símbolo) o si
                 los argumentos son inválidos.
-            InsufficientFundsError: si el coste total supera el efectivo.
+            InsufficientFundsError: si el coste total supera el efectivo
+                (solo con ``enforce_funds=True``).
         """
         if price <= 0 or quantity <= 0:
             raise ExecutionError(
@@ -170,21 +181,68 @@ class Portfolio:
         notional = exec_price * quantity
         commission = notional * self.commission_pct
         cost = notional + commission
-        if cost > self.cash:
+        if enforce_funds and cost > self.cash:
             raise InsufficientFundsError(
                 f"Coste {cost:.2f} > efectivo {self.cash:.2f} para {symbol}")
 
         self.cash -= cost
-        self.positions[symbol] = Position(symbol, quantity, exec_price)
+        self.positions[symbol] = Position(symbol, quantity, exec_price,
+                                          entry_commission=commission)
         trade = Trade(symbol, "buy", quantity, exec_price, commission)
+        self.trades.append(trade)
+        return trade
+
+    def reduce_position(self, symbol: str, price: float, quantity: float) -> Trade:
+        """Vende ``quantity`` acciones de la posición (cierre parcial o total).
+
+        Aplica slippage adverso (vende a ``price * (1 - slippage_pct)``)
+        y comisión sobre el nocional. Si ``quantity`` iguala la posición,
+        esta se elimina (equivale a :meth:`close_position`).
+
+        Args:
+            symbol: ticker a vender.
+            price: precio de mercado de referencia (> 0).
+            quantity: nº de acciones a vender, en ``(0, posición]``.
+
+        Returns:
+            El :class:`Trade` de venta con el ``pnl`` realizado de la parte
+            vendida (neto de la comisión de salida).
+
+        Raises:
+            ExecutionError: si no hay posición, el precio es inválido o la
+                cantidad excede la posición.
+        """
+        if price <= 0:
+            raise ExecutionError(f"Precio inválido: {price}")
+        pos = self.positions.get(symbol)
+        if pos is None:
+            raise ExecutionError(f"No hay posición abierta en {symbol}")
+        if quantity <= 0 or quantity > pos.quantity:
+            raise ExecutionError(
+                f"Cantidad {quantity} inválida para la posición de "
+                f"{pos.quantity} en {symbol}")
+
+        exec_price = price * (1.0 - self.slippage_pct)
+        notional = exec_price * quantity
+        commission = notional * self.commission_pct
+        self.cash += notional - commission
+        # P&L del viaje completo: incluye la parte proporcional de la
+        # comisión de entrada (antes solo se descontaba la de salida).
+        entry_fee = pos.entry_commission * (quantity / pos.quantity)
+        pnl = (exec_price - pos.entry_price) * quantity - commission - entry_fee
+        if quantity == pos.quantity:
+            del self.positions[symbol]
+        else:
+            pos.quantity -= quantity
+            pos.entry_commission -= entry_fee
+        trade = Trade(symbol, "sell", quantity, exec_price, commission, pnl)
         self.trades.append(trade)
         return trade
 
     def close_position(self, symbol: str, price: float) -> Trade:
         """Cierra por completo la posición en ``symbol`` vendiendo a mercado.
 
-        Aplica slippage adverso (vende a ``price * (1 - slippage_pct)``)
-        y comisión sobre el nocional.
+        Equivale a :meth:`reduce_position` con toda la cantidad.
 
         Args:
             symbol: ticker a vender.
@@ -197,17 +255,7 @@ class Portfolio:
         Raises:
             ExecutionError: si no hay posición abierta o el precio es inválido.
         """
-        if price <= 0:
-            raise ExecutionError(f"Precio inválido: {price}")
-        pos = self.positions.pop(symbol, None)
+        pos = self.positions.get(symbol)
         if pos is None:
             raise ExecutionError(f"No hay posición abierta en {symbol}")
-
-        exec_price = price * (1.0 - self.slippage_pct)
-        notional = exec_price * pos.quantity
-        commission = notional * self.commission_pct
-        self.cash += notional - commission
-        pnl = (exec_price - pos.entry_price) * pos.quantity - commission
-        trade = Trade(symbol, "sell", pos.quantity, exec_price, commission, pnl)
-        self.trades.append(trade)
-        return trade
+        return self.reduce_position(symbol, price, pos.quantity)

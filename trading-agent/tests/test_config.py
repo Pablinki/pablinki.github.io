@@ -39,10 +39,36 @@ class TestValidation:
     @pytest.mark.parametrize("kwargs", [
         {"provider": "iex"}, {"symbols": ()}, {"lookback_days": 0},
         {"max_retries": -1},
+        {"symbols": ("../etc/passwd",)},     # inyección de ruta en la caché
+        {"symbols": ("AAPL MSFT",)},         # espacios
+        {"symbols": ("aapl",)},              # minúsculas
+        {"symbols": ("A" * 16,)},            # demasiado largo
     ])
     def test_invalid_data_params_raise(self, kwargs):
         with pytest.raises(ConfigurationError):
             DataConfig(**kwargs)
+
+    @pytest.mark.parametrize("symbol", ["AAPL", "BRK-B", "BTC-USD", "^GSPC",
+                                        "ES=F", "RDS.A"])
+    def test_valid_ticker_shapes(self, symbol):
+        assert DataConfig(symbols=(symbol,)).symbols == (symbol,)
+
+    def test_unsupported_interval_raises(self):
+        with pytest.raises(ConfigurationError, match="interval"):
+            DataConfig(interval="2h")
+
+    def test_yahoo_intraday_lookback_limit(self):
+        with pytest.raises(ConfigurationError, match="Yahoo"):
+            DataConfig(interval="1m", lookback_days=30)
+        assert DataConfig(interval="1m", lookback_days=7).lookback_days == 7
+        # Bloomberg no tiene ese límite.
+        assert DataConfig(provider="bloomberg", interval="1m",
+                          lookback_days=30).lookback_days == 30
+
+    def test_cooldown_bars_validation(self):
+        assert RiskConfig(cooldown_bars=3).cooldown_bars == 3
+        with pytest.raises(ConfigurationError):
+            RiskConfig(cooldown_bars=-1)
 
     @pytest.mark.parametrize("kwargs", [
         {"window_size": 1}, {"initial_cash": 0.0},

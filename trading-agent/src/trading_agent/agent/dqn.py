@@ -195,11 +195,16 @@ class DQNAgent:
     # ------------------------------------------------------------------ #
     # Persistencia                                                       #
     # ------------------------------------------------------------------ #
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | Path,
+             metadata: dict[str, object] | None = None) -> None:
         """Guarda los pesos y el estado de entrenamiento en disco.
 
         Args:
             path: ruta destino del checkpoint (``.pt``).
+            metadata: dict serializable (solo tipos primitivos: str, int,
+                float, list, dict) que describe el contexto de
+                entrenamiento — ventana, features, intervalo, símbolo —
+                para verificar compatibilidad al cargar.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,19 +216,25 @@ class DQNAgent:
             "train_steps": self.train_steps,
             "state_dim": self.config.state_dim,
             "n_actions": self.config.n_actions,
+            "metadata": dict(metadata or {}),
         }, path)
         logger.info("Checkpoint guardado en %s", path)
 
-    def load(self, path: str | Path) -> None:
+    def load(self, path: str | Path,
+             expected_metadata: dict[str, object] | None = None) -> None:
         """Restaura un checkpoint guardado con :meth:`save`.
 
         Args:
             path: ruta del checkpoint.
+            expected_metadata: si se indica, cada clave debe coincidir con
+                la guardada en el checkpoint (ventana, features, intervalo,
+                símbolo...). Un modelo entrenado con otra configuración
+                tomaría decisiones sin sentido de forma silenciosa.
 
         Raises:
-            TradingAgentError: si el archivo no existe o las dimensiones
-                del checkpoint no coinciden con la configuración actual
-                (cargar pesos incompatibles produciría basura silenciosa).
+            TradingAgentError: si el archivo no existe, las dimensiones no
+                coinciden, los metadatos difieren o los pesos no encajan
+                en la arquitectura configurada.
         """
         path = Path(path)
         if not path.is_file():
@@ -236,9 +247,25 @@ class DQNAgent:
                 f"Checkpoint incompatible: state_dim/n_actions del archivo "
                 f"({ckpt.get('state_dim')}/{ckpt.get('n_actions')}) != "
                 f"config ({self.config.state_dim}/{self.config.n_actions})")
-        self.online.load_state_dict(ckpt["online"])
-        self.target.load_state_dict(ckpt["target"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
+        if expected_metadata:
+            saved = ckpt.get("metadata") or {}
+            mismatches = {k: (saved.get(k), v)
+                          for k, v in expected_metadata.items()
+                          if saved.get(k) != v}
+            if mismatches:
+                raise TradingAgentError(
+                    "Checkpoint incompatible con la configuración actual "
+                    f"(guardado -> esperado): {mismatches}. Reentrena el "
+                    "modelo con esta configuración.")
+        try:
+            self.online.load_state_dict(ckpt["online"])
+            self.target.load_state_dict(ckpt["target"])
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+        except (RuntimeError, KeyError, ValueError) as exc:
+            raise TradingAgentError(
+                f"Los pesos de {path} no encajan en la arquitectura "
+                f"configurada (hidden_sizes={self.config.hidden_sizes}): {exc}"
+            ) from exc
         self.epsilon = float(ckpt["epsilon"])
         self.train_steps = int(ckpt["train_steps"])
         logger.info("Checkpoint cargado desde %s (pasos=%d, eps=%.3f)",

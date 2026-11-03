@@ -1,6 +1,9 @@
 # Artefactos de ejecución (nunca al repo)
 .cache/
 checkpoints/
+logs/
+*.csv
+risk_state*.json
 __pycache__/
 *.pyc
 .pytest_cache/

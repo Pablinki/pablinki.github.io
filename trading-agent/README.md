@@ -70,8 +70,12 @@ modo *paper trading* con una capa de **gestión de riesgo determinista**.
 | `agent/dqn.py` | Agente Double DQN + red objetivo + persistencia |
 | `portfolio.py` | Posiciones, trades, equity |
 | `risk.py` | Stop-loss, take-profit, drawdown, pérdida diaria |
-| `train.py` | Bucle de entrenamiento y evaluación |
-| `live.py` | Bucle de trading en tiempo real (paper) |
+| `train.py` | Bucle de entrenamiento, split temporal 3 vías y evaluación en test |
+| `live.py` | Bucle de trading en tiempo real (paper o broker real) |
+| `brokers/` | `BrokerAdapter`, `PaperBroker` (simulado) y `AlpacaBroker` (real) |
+| `metrics.py` | Drawdown máximo, Sharpe, profit factor |
+| `journal.py` | Diario CSV de operaciones (auditoría) |
+| `logging_setup.py` | Consola + archivo con rotación diaria |
 
 ---
 
@@ -88,7 +92,7 @@ Requiere **Python 3.10–3.12** (probado con 3.11). Las versiones de
 cd trading-agent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt        # numpy 1.26 + pandas 2.2 + torch 2.6 ...
-pytest                                  # verifica la instalación: 135 tests
+pytest                                  # verifica la instalación: 264 tests
 ```
 
 ---
@@ -150,9 +154,17 @@ El problema se formula como un **Proceso de Decisión de Markov**:
   - Pérdida Huber + recorte de gradiente + replay buffer de 100k
     transiciones + política ε-greedy con decaimiento por episodio.
 
-- **Anti *look-ahead bias***: el split train/validación es **temporal**
-  (nunca aleatorio) y el mejor checkpoint se elige por retorno en
-  validación (datos que el agente jamás vio al entrenar).
+- **Anti *look-ahead bias***: el histórico se divide **por tiempo** (nunca
+  aleatorio) en train (70%) / validación (15%) / **test** (15%). El mejor
+  checkpoint se elige por retorno en validación y, al terminar, se evalúa
+  una sola vez en el tramo de test, que nunca influyó ni en entrenar ni en
+  elegir: es la estimación honesta fuera de muestra.
+
+- **Métricas de evaluación** (`episode_summary`): retorno total,
+  benchmark **comprar-y-mantener** del mismo tramo y exceso sobre él,
+  **drawdown máximo**, **Sharpe** anualizado, *profit factor*, nº de
+  operaciones y *win rate*. El log de entrenamiento muestra el B&H de
+  validación en cada episodio y las métricas de test al final.
 
 - **Realismo del backtest**: cada operación paga **comisión** y sufre
   **slippage** adverso configurables; al terminar el episodio la posición
@@ -187,7 +199,10 @@ evalúan antes de consultar a la red):
 1. **Dimensionamiento** *fixed-fraction*: nunca más de `max_position_pct`
    del equity en una posición.
 2. **Stop-loss / take-profit** por posición: cierre forzoso a
-   `-stop_loss_pct` / `+take_profit_pct`.
+   `-stop_loss_pct` / `+take_profit_pct`. En backtest se evalúan
+   **intrabarra** (contra el mínimo/máximo de la vela, ejecutando al nivel
+   del stop o a la apertura si hay hueco), igual que en vivo se evalúan con
+   cada precio. Tras un cierre forzoso, `cooldown_bars` velas sin reentrar.
 3. **Límite de pérdida diaria**: superada, no se abren posiciones nuevas
    ese día.
 4. **Kill-switch de drawdown**: si el equity cae `max_drawdown_pct` desde
@@ -271,6 +286,72 @@ adaptador rechaza arrancar en live (`SecurityError`). Ten presente la
 regla *Pattern Day Trader* de EE. UU. (25.000 USD mínimos para >3
 day-trades en 5 días hábiles) si usas intervalos intradía.
 
+## Operación en producción
+
+Reglas que aplica el bucle en vivo (`LiveTrader`) para funcionar 24/7 sin
+supervisión:
+
+- **Una decisión por vela**: el agente solo se consulta cuando cambia la
+  marca temporal de la última vela. Con el mercado cerrado (o sondeando
+  más rápido que el intervalo) el mismo estado produciría la misma acción
+  y el agente alternaría compra/venta sobre datos idénticos. Los stops sí
+  se re-evalúan con cada precio.
+- **Reloj de mercado**: con un broker real no se envía ninguna orden si el
+  mercado está cerrado (quedaría colgada hasta el timeout). Un stop-loss
+  pendiente se ejecuta en la primera iteración con mercado abierto.
+- **Diario de operaciones** (`--journal logs/trades.csv`, activo por
+  defecto): cada compra, venta, cierre forzoso y liquidación queda en un
+  CSV *append-only* con timestamp UTC, precio, comisión, P&L, motivo y
+  equity — la fuente de verdad para reconciliar contra el broker.
+- **Reinicios seguros**: con Alpaca, al arrancar se sincronizan efectivo
+  y posiciones abiertas reales en el espejo local, así una posición
+  abierta antes de un reinicio sigue protegida por el RiskManager.
+- **Cortacircuitos**: un error no previsto se registra con traza y el
+  bucle continúa; `max_consecutive_errors` (10) errores seguidos lo
+  detienen. Pase lo que pase (señal, kill-switch, excepción), la
+  liquidación final se intenta siempre (`finally`).
+- **Estado de riesgo persistente** (`--risk-state logs/risk_state.json`):
+  pico de equity, kill-switch y enfriamiento sobreviven a un reinicio. Si
+  el proceso paró por drawdown, **se niega a arrancar** hasta que un humano
+  borre o edite ese archivo: un reinicio automático nunca rearma el
+  kill-switch solo.
+- **Reconciliación diaria**: con un broker real, al cambiar de jornada el
+  espejo local se re-sincroniza con la cuenta (efectivo y posiciones); una
+  divergencia se registra como `CRITICAL` y manda la versión del broker.
+- **Órdenes idempotentes** (Alpaca): cada decisión lleva un
+  `client_order_id` determinista; si el proceso muere tras enviar la orden
+  y vuelve a intentarlo, Alpaca la rechaza como duplicada y el adaptador la
+  recupera por id en lugar de comprar dos veces. Los fills parciales tras
+  un timeout se reflejan en el espejo (nunca acciones reales sin contar).
+- **Supervisión**: `logs/heartbeat.json` se reescribe en cada iteración;
+  `scripts/healthcheck.py` (y el `HEALTHCHECK` de Docker) lo leen y marcan
+  el proceso como no sano si envejece, si el kill-switch está activo o si
+  acumula errores — un proceso "vivo" que dejó de operar no pasa
+  desapercibido. Log con rotación diaria en `logs/trader.log`.
+- **Códigos de salida** distinguibles para la política de reinicio:
+  `0` parada deliberada, `1` error controlado al arrancar, `2` kill-switch
+  (no reiniciar a ciegas: el estado persistido impide rearrancar),
+  `3` cortacircuitos (reiniciar tiene sentido).
+- **Docker / Compose**: `Dockerfile` (imagen `python:3.11-slim`, torch CPU,
+  usuario sin privilegios, `HEALTHCHECK`, `SIGTERM` → parada limpia) y
+  `docker-compose.yml` con `restart: on-failure`, `stop_grace_period: 120s`
+  (tiempo para liquidar) y credenciales desde `.env` (plantilla en
+  `.env.example`):
+
+  ```bash
+  cp .env.example .env            # rellena las claves; .env nunca se sube
+  docker compose up -d --build
+  docker compose logs -f trader
+  docker compose stop             # parada limpia con liquidación
+  ```
+
+- **Un símbolo por proceso**: cada proceso opera `symbols[0]` con su propia
+  config y carpeta `logs/`; las posiciones de otros símbolos en la misma
+  cuenta se ignoran (con aviso). Para N símbolos, N servicios.
+- **CI**: en cada push/PR, GitHub Actions ejecuta lint (`ruff`), tipado
+  (`mypy`), la suite completa y los doctests (los ejemplos de la
+  documentación se verifican).
+
 ## Escalabilidad
 
 - **Proveedores intercambiables** (patrón Strategy + Factory): añadir IEX,
@@ -291,7 +372,7 @@ day-trades en 5 días hábiles) si usas intervalos intradía.
 
 ## Tests
 
-135 tests automatizados (`pytest`) que **no tocan la red**: los datos de mercado se
+264 tests automatizados (`pytest`) que **no tocan la red**: los datos de mercado se
 generan sintéticamente con semilla fija (deterministas, corren en CI sin
 credenciales).
 
@@ -314,8 +395,14 @@ Cobertura por área:
   sincronización de la red objetivo, guardado/carga de checkpoints.
 - `test_train.py` — split temporal anti look-ahead + entrenamiento
   end-to-end de humo.
-- `test_live.py` — bucle en vivo con proveedor falso: sobrevive a fallos
-  de datos, liquida al parar; y toda la capa de seguridad.
+- `test_live.py` — bucle en vivo con proveedor falso: una decisión por
+  vela, mercado cerrado, diario, cortacircuitos, estado de riesgo
+  persistente, reconciliación, heartbeat; y toda la capa de seguridad.
+- `test_brokers.py` — Alpaca con sesión HTTP falsa: fills, sondeo,
+  idempotencia (`client_order_id`), fills parciales, timeout + cancelación,
+  allowlist de hosts, redirecciones, sincronización de cuenta.
+- `test_metrics.py`, `test_journal.py`, `test_cli.py` — métricas de
+  evaluación, diario CSV, healthcheck y logging.
 
 ---
 

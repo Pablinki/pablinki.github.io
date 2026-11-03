@@ -12,7 +12,7 @@ from trading_agent.config import (
     RiskConfig,
 )
 from trading_agent.exceptions import TradingAgentError
-from trading_agent.train import time_split, train
+from trading_agent.train import three_way_split, time_split, train
 
 
 def small_config() -> AppConfig:
@@ -40,6 +40,20 @@ class TestTimeSplit:
             time_split(ohlcv, frac)
 
 
+class TestThreeWaySplit:
+    def test_three_consecutive_time_ordered_parts(self, ohlcv):
+        tr, va, te = three_way_split(ohlcv, 0.7, 0.15)
+        assert len(tr) + len(va) + len(te) == len(ohlcv)
+        assert tr.index.max() < va.index.min() < va.index.max() < te.index.min()
+        assert len(tr) == int(len(ohlcv) * 0.7)
+
+    @pytest.mark.parametrize("tr,va", [(0.0, 0.5), (0.5, 0.5), (0.9, 0.2),
+                                       (1.0, 0.1)])
+    def test_invalid_fractions_raise(self, ohlcv, tr, va):
+        with pytest.raises(TradingAgentError):
+            three_way_split(ohlcv, tr, va)
+
+
 class TestTrainIntegration:
     def test_end_to_end_training_saves_checkpoint(self, ohlcv, tmp_path):
         """Humo de integración: entrena 2 episodios reales y verifica que
@@ -50,6 +64,11 @@ class TestTrainIntegration:
         assert ckpt.exists()
         assert metrics["episodes_run"] == 2.0
         assert metrics["best_val_return"] > -1.0  # no perdió todo el capital
+        # Evaluación fuera de muestra con el mejor checkpoint.
+        for key in ("test_return", "test_buy_and_hold", "test_sharpe",
+                    "test_max_drawdown"):
+            assert key in metrics
+        assert 0.0 <= metrics["test_max_drawdown"] <= 1.0
 
     def test_zero_episodes_raises(self, ohlcv, tmp_path):
         with pytest.raises(TradingAgentError, match="episodes"):

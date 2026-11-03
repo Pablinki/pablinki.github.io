@@ -36,11 +36,22 @@ Ejemplo
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .exceptions import ConfigurationError
+
+#: Caracteres permitidos en un ticker (evita rutas o parámetros inyectados).
+SYMBOL_PATTERN = re.compile(r"[A-Z0-9^][A-Z0-9.\-=^]{0,14}")
+
+#: Intervalos de vela soportados por todo el sistema (datos, features, vivo).
+SUPPORTED_INTERVALS = ("1m", "5m", "15m", "30m", "1h", "1d")
+
+#: Máximo de días de histórico que Yahoo Finance sirve por intervalo
+#: intradía (los diarios no tienen límite práctico).
+YAHOO_MAX_LOOKBACK_DAYS = {"1m": 7, "5m": 60, "15m": 60, "30m": 60, "1h": 730}
 
 
 def _require(condition: bool, message: str) -> None:
@@ -63,7 +74,10 @@ class DataConfig:
 
     Attributes:
         provider: nombre del proveedor: ``"yahoo"`` o ``"bloomberg"``.
-        symbols: lista de tickers a operar, p. ej. ``["AAPL", "MSFT"]``.
+        symbols: tickers; **cada proceso entrena/opera solo el primero**
+            (un símbolo por proceso: aislamiento de fallos y de estado de
+            riesgo). Para varios símbolos, lanza un proceso por símbolo con
+            su propia config y carpeta ``logs/``.
         interval: granularidad de las velas (``"1m"``, ``"5m"``, ``"1h"``,
             ``"1d"``...). Debe ser soportada por el proveedor.
         lookback_days: días de histórico a descargar para entrenamiento.
@@ -72,6 +86,9 @@ class DataConfig:
             (espera real = ``retry_backoff_s * 2**intento``).
         cache_dir: directorio donde se cachean descargas (evita golpear
             la API en cada corrida). ``None`` desactiva el caché.
+        bloomberg_suffix: sufijo de identificador Bloomberg que se añade
+            al ticker (``"AAPL"`` -> ``"AAPL US Equity"``). Cámbialo para
+            otros mercados (p. ej. ``"MM Equity"`` para México).
     """
 
     provider: str = "yahoo"
@@ -81,12 +98,28 @@ class DataConfig:
     max_retries: int = 3
     retry_backoff_s: float = 1.0
     cache_dir: str | None = ".cache/market_data"
+    bloomberg_suffix: str = "US Equity"
 
     def __post_init__(self) -> None:
         _require(self.provider in ("yahoo", "bloomberg"),
                  f"provider debe ser 'yahoo' o 'bloomberg', no {self.provider!r}")
         _require(len(self.symbols) > 0, "symbols no puede estar vacío")
+        # Los símbolos acaban en nombres de archivo (caché) y en peticiones
+        # HTTP: solo caracteres de ticker (AAPL, BRK-B, BTC-USD, ^GSPC, ES=F).
+        for s in self.symbols:
+            _require(bool(SYMBOL_PATTERN.fullmatch(s)),
+                     f"Símbolo inválido {s!r}: use solo A-Z, 0-9, '.', '-', "
+                     "'=' o '^' (máx. 15 caracteres)")
+        _require(self.interval in SUPPORTED_INTERVALS,
+                 f"interval debe ser uno de {SUPPORTED_INTERVALS}, no "
+                 f"{self.interval!r}")
         _require(self.lookback_days > 0, "lookback_days debe ser > 0")
+        if self.provider == "yahoo" and self.interval in YAHOO_MAX_LOOKBACK_DAYS:
+            limit = YAHOO_MAX_LOOKBACK_DAYS[self.interval]
+            _require(self.lookback_days <= limit,
+                     f"Yahoo Finance solo sirve {limit} días de velas de "
+                     f"{self.interval}; lookback_days={self.lookback_days} "
+                     "sería rechazado (ajústalo o usa interval: 1d)")
         _require(self.max_retries >= 0, "max_retries debe ser >= 0")
         _require(self.retry_backoff_s >= 0, "retry_backoff_s debe ser >= 0")
 
@@ -128,7 +161,7 @@ class AgentConfig:
     gamma: float = 0.99
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
-    epsilon_decay: float = 0.995
+    epsilon_decay: float = 0.93  # 0.93**50 ≈ 0.03: llega al mínimo en ~40 episodios
     batch_size: int = 64
     buffer_capacity: int = 100_000
     min_buffer_size: int = 1_000
@@ -199,6 +232,10 @@ class RiskConfig:
             automático (``None`` la desactiva).
         max_daily_loss_pct: pérdida diaria máxima del equity; al superarse
             no se abren posiciones nuevas ese día.
+        cooldown_bars: nº de velas tras un cierre forzoso (stop-loss /
+            take-profit) durante las cuales no se abre posición nueva
+            (0 = sin enfriamiento). Evita reentrar al mismo precio justo
+            después de un stop. Se aplica igual en backtest y en vivo.
     """
 
     max_position_pct: float = 0.25
@@ -206,6 +243,7 @@ class RiskConfig:
     stop_loss_pct: float = 0.05
     take_profit_pct: float | None = 0.10
     max_daily_loss_pct: float = 0.03
+    cooldown_bars: int = 0
 
     def __post_init__(self) -> None:
         _require(0 < self.max_position_pct <= 1, "max_position_pct debe estar en (0, 1]")
@@ -215,6 +253,7 @@ class RiskConfig:
                  "take_profit_pct debe ser > 0 o None")
         _require(0 < self.max_daily_loss_pct <= 1,
                  "max_daily_loss_pct debe estar en (0, 1]")
+        _require(self.cooldown_bars >= 0, "cooldown_bars debe ser >= 0")
 
 
 @dataclass(frozen=True)

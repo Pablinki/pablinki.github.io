@@ -121,6 +121,18 @@ class TestPersistence:
         s = np.ones(STATE_DIM, dtype=np.float32)
         assert agent.act(s, greedy=True) == agent2.act(s, greedy=True)
 
+    def test_metadata_roundtrip_and_mismatch(self, tmp_path):
+        """Los metadatos del checkpoint detectan un cambio de configuración
+        (ventana, features, intervalo...) antes de operar con pesos ajenos."""
+        agent = make_agent()
+        path = tmp_path / "ckpt.pt"
+        meta = {"window_size": 30, "interval": "1d", "symbol": "AAPL",
+                "feature_columns": ["a", "b"]}
+        agent.save(path, metadata=meta)
+        make_agent().load(path, expected_metadata=meta)  # coincide: OK
+        with pytest.raises(TradingAgentError, match="Reentrena"):
+            make_agent().load(path, expected_metadata={**meta, "interval": "1m"})
+
     def test_load_missing_file_raises(self, tmp_path):
         with pytest.raises(TradingAgentError, match="No existe"):
             make_agent().load(tmp_path / "nope.pt")

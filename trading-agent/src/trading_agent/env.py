@@ -75,6 +75,7 @@ import pandas as pd
 from .config import EnvConfig, RiskConfig
 from .exceptions import EnvironmentError_
 from .features import FEATURE_COLUMNS, build_features
+from .metrics import max_drawdown, profit_factor, sharpe_ratio
 from .portfolio import Portfolio
 from .risk import RiskManager
 
@@ -101,7 +102,9 @@ class TradingEnvironment:
     N_PORTFOLIO_FEATURES = 2
 
     def __init__(self, ohlcv: pd.DataFrame, env_config: EnvConfig,
-                 risk_config: RiskConfig, symbol: str = "ASSET") -> None:
+                 risk_config: RiskConfig, symbol: str = "ASSET",
+                 features: pd.DataFrame | None = None,
+                 periods_per_year: int = 252) -> None:
         """
         Args:
             ohlcv: DataFrame OHLCV canónico con histórico suficiente
@@ -109,20 +112,39 @@ class TradingEnvironment:
             env_config: reglas de simulación (ventana, comisiones...).
             risk_config: límites del gestor de riesgo.
             symbol: nombre del activo (solo informativo).
+            features: matriz de features precalculada (índice ⊆ índice de
+                ``ohlcv``). Permite calcular los indicadores UNA vez sobre
+                el histórico completo y luego partir por tiempo, sin que
+                cada tramo pierda su calentamiento ni arranque con EMAs
+                transitorias. Los indicadores son causales (solo usan el
+                pasado), así que no introduce fuga de información.
+            periods_per_year: velas por año para anualizar el Sharpe (252
+                para velas diarias; ver ``metrics.PERIODS_PER_YEAR``).
 
         Raises:
             DataValidationError: si el histórico es demasiado corto.
         """
         self.symbol = symbol
         self.env_config = env_config
+        self.periods_per_year = periods_per_year
         self.risk = RiskManager(risk_config)
 
-        self._features = build_features(ohlcv)
-        # Precio de cierre alineado con las filas de features supervivientes.
-        self._prices = ohlcv.loc[self._features.index, "close"].to_numpy()
+        if features is None:
+            self._features = build_features(ohlcv)
+        else:
+            self._features = features.loc[features.index.isin(ohlcv.index),
+                                          list(FEATURE_COLUMNS)]
+        # OHLC alineado con las filas de features supervivientes. Los stops
+        # se evalúan contra el rango completo de la vela (open/high/low),
+        # no solo contra el cierre: en vivo se disparan con cualquier precio.
+        aligned = ohlcv.loc[self._features.index]
+        self._prices = aligned["close"].to_numpy()
+        self._opens = aligned["open"].to_numpy()
+        self._highs = aligned["high"].to_numpy()
+        self._lows = aligned["low"].to_numpy()
         self._feat_matrix = self._features.to_numpy(dtype=np.float32)
         # Fechas de calendario por vela: arman el límite de pérdida diaria.
-        self._dates = self._features.index.date
+        self._dates = pd.DatetimeIndex(self._features.index).date
 
         n_steps = len(self._features) - env_config.window_size
         if n_steps < 2:
@@ -138,6 +160,7 @@ class TradingEnvironment:
         self._t = 0
         self._portfolio: Portfolio | None = None
         self._done = True
+        self._equity_curve: list[float] = []  # equity por vela (métricas)
 
     # ------------------------------------------------------------------ #
     # API estilo Gym                                                     #
@@ -158,6 +181,7 @@ class TradingEnvironment:
         self.risk.update_equity(self.env_config.initial_cash)
         self.risk.start_new_day(self.env_config.initial_cash)
         self._done = False
+        self._equity_curve = [self.env_config.initial_cash]
         return self._observe()
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, dict[str, Any]]:
@@ -207,16 +231,25 @@ class TradingEnvironment:
         self._t += 1
         new_price = float(self._prices[self._t])
         if self._dates[self._t] != self._dates[self._t - 1]:
-            self.risk.start_new_day(
-                self._portfolio.equity({self.symbol: new_price}))
+            # Equity al cierre anterior: así el hueco de apertura cuenta
+            # dentro de la pérdida del día (con velas diarias, cada vela
+            # es un día y el límite actúa como tope de pérdida por vela).
+            self.risk.start_new_day(equity_before)
 
-        # (3) Cierres forzosos por gestión de riesgo.
+        # (3) Cierres forzosos por gestión de riesgo, evaluados INTRABARRA:
+        # si el mínimo/máximo de la vela cruza el stop/take-profit, se
+        # ejecuta al nivel del stop (o a la apertura si la vela abre con
+        # hueco más allá), igual que ocurriría en vivo.
+        self.risk.new_bar()
         forced_close = None
         if self._portfolio.has_position(self.symbol):
-            reason = self.risk.should_force_close(
-                self._portfolio.positions[self.symbol], new_price)
+            reason, fill_price = self.risk.evaluate_bar(
+                self._portfolio.positions[self.symbol],
+                float(self._opens[self._t]), float(self._highs[self._t]),
+                float(self._lows[self._t]), new_price)
             if reason is not None:
-                self._portfolio.close_position(self.symbol, new_price)
+                self._portfolio.close_position(self.symbol, fill_price)
+                self.risk.on_forced_close()
                 forced_close = reason
 
         # (4) Fin de episodio y liquidación ANTES de calcular la recompensa:
@@ -233,6 +266,7 @@ class TradingEnvironment:
         equity_after = self._portfolio.equity({self.symbol: new_price})
         reward = (np.log(equity_after / equity_before)
                   * self.env_config.reward_scaling)
+        self._equity_curve.append(equity_after)
 
         info = {
             "t": self._t,
@@ -242,6 +276,10 @@ class TradingEnvironment:
             "has_position": self._portfolio.has_position(self.symbol),
             "forced_close": forced_close,
             "halted": self.risk.halted,
+            # Distinción RL estándar: ``terminated`` = fin real del MDP
+            # (kill-switch); el agotamiento de datos es un truncamiento
+            # artificial y NO debe anular el valor futuro en el objetivo Q.
+            "terminated": self.risk.halted,
         }
         return self._observe(), float(reward), self._done, info
 
@@ -280,7 +318,11 @@ class TradingEnvironment:
         """
         assert self._portfolio is not None
         w = self.env_config.window_size
-        window = self._feat_matrix[self._t - w:self._t].reshape(-1)
+        # La ventana TERMINA en la vela actual t (inclusive): la acción se
+        # ejecuta al cierre de t con toda la información de t. El bucle en
+        # vivo construye el estado exactamente igual (últimas w velas
+        # completadas), así entrenamiento y producción ven lo mismo.
+        window = self._feat_matrix[self._t - w + 1:self._t + 1].reshape(-1)
 
         price = float(self._prices[self._t])
         if self._portfolio.has_position(self.symbol):
@@ -298,18 +340,37 @@ class TradingEnvironment:
         """Métricas del episodio en curso/terminado.
 
         Returns:
-            Dict con ``final_equity``, ``total_return_pct``, ``n_trades``
-            y ``win_rate`` (fracción de ventas con P&L > 0).
+            Dict con:
+                - ``final_equity``: equity final en USD.
+                - ``total_return_pct``: retorno total (0.05 = +5%).
+                - ``buy_and_hold_return_pct``: benchmark comprar-y-mantener
+                  sobre el mismo tramo de precios (del primer paso al actual).
+                - ``excess_return_pct``: ``total_return_pct`` menos el benchmark.
+                - ``max_drawdown_pct``: peor caída desde un pico, en [0, 1].
+                - ``sharpe``: ratio de Sharpe anualizado con
+                  ``periods_per_year`` velas por año (252 en velas diarias).
+                - ``profit_factor``: ganancias brutas / pérdidas brutas.
+                - ``n_trades``: nº de operaciones (compras + ventas).
+                - ``win_rate``: fracción de ventas con P&L > 0.
         """
         if self._portfolio is None:
             raise EnvironmentError_("No hay episodio: llama a reset()")
         sells = [t for t in self._portfolio.trades if t.side == "sell"]
         wins = sum(1 for t in sells if t.pnl > 0)
         final_price = float(self._prices[self._t])
+        first_price = float(self._prices[self.env_config.window_size])
         equity = self._portfolio.equity({self.symbol: final_price})
+        total_return = equity / self.env_config.initial_cash - 1.0
+        buy_and_hold = final_price / first_price - 1.0
         return {
             "final_equity": equity,
-            "total_return_pct": equity / self.env_config.initial_cash - 1.0,
+            "total_return_pct": total_return,
+            "buy_and_hold_return_pct": buy_and_hold,
+            "excess_return_pct": total_return - buy_and_hold,
+            "max_drawdown_pct": max_drawdown(self._equity_curve),
+            "sharpe": sharpe_ratio(self._equity_curve,
+                                   periods_per_year=self.periods_per_year),
+            "profit_factor": profit_factor(self._portfolio.trades),
             "n_trades": float(len(self._portfolio.trades)),
             "win_rate": wins / len(sells) if sells else 0.0,
         }

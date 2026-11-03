@@ -11,11 +11,26 @@ Entradas:
     --checkpoint: modelo entrenado a cargar.
     --poll-seconds: segundos entre decisiones.
     --max-iterations: tope de iteraciones (0 = infinito).
+    --broker: ``paper`` (simulado) o ``alpaca``.
+    --journal / --risk-state / --heartbeat / --log-file: archivos de
+    operación bajo ``logs/`` (cadena vacía para desactivar cada uno).
 
-Seguridad:
-    Este script SIEMPRE opera en modo paper (simulado). Conectar un broker
-    real exige además exportar TRADING_AGENT_LIVE=YES y escribir el
-    adaptador de ejecución correspondiente.
+Códigos de salida (para la política de reinicio del supervisor):
+    0  parada deliberada (señal del operador o ``--max-iterations``)
+    1  error controlado al arrancar (configuración, checkpoint, credenciales,
+       kill-switch activo en el estado persistido)
+    2  kill-switch de drawdown: NO reiniciar automáticamente; revisar la
+       cuenta y rearmar a conciencia (borrar/editar ``--risk-state``)
+    3  cortacircuitos por errores repetidos: reiniciar tiene sentido
+
+Seguridad (tres niveles):
+    1. ``--broker paper`` (defecto): simulación local, sin broker.
+    2. ``--broker alpaca``: órdenes reales contra el entorno PAPER de
+       Alpaca (dinero ficticio) salvo que se cambie ALPACA_BASE_URL.
+    3. Dinero real: además de ALPACA_BASE_URL=https://api.alpaca.markets
+       exige TRADING_AGENT_LIVE=YES; sin ambas, el arranque falla.
+    El estado de riesgo (pico de equity, kill-switch) persiste en
+    ``--risk-state`` para que un reinicio no lo rearme solo.
 """
 
 from __future__ import annotations
@@ -30,6 +45,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from trading_agent.config import load_config
 from trading_agent.exceptions import TradingAgentError
 from trading_agent.live import build_live_trader
+from trading_agent.logging_setup import configure_logging
+
+#: Traducción del motivo de parada de ``run_forever`` a código de salida.
+EXIT_CODES = {"max_iterations": 0, "signal": 0, "kill_switch": 2,
+              "circuit_breaker": 3}
 
 
 def main() -> int:
@@ -47,23 +67,45 @@ def main() -> int:
                              "'alpaca' usa la API de Alpaca (paper de Alpaca "
                              "por defecto; dinero real solo con "
                              "TRADING_AGENT_LIVE=YES y ALPACA_BASE_URL live)")
+    parser.add_argument("--journal", default="logs/trades.csv",
+                        help="Diario CSV de operaciones (cadena vacía para "
+                             "desactivarlo)")
+    parser.add_argument("--risk-state", default="logs/risk_state.json",
+                        help="Estado persistente del gestor de riesgo "
+                             "(cadena vacía = solo memoria)")
+    parser.add_argument("--heartbeat", default="logs/heartbeat.json",
+                        help="Heartbeat JSON por iteración para supervisión "
+                             "(cadena vacía para desactivarlo)")
+    parser.add_argument("--log-file", default="logs/trader.log",
+                        help="Log con rotación diaria (cadena vacía = solo "
+                             "consola)")
+    parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s")
+    try:
+        configure_logging(args.log_level, args.log_file or None)
+    except (OSError, ValueError) as exc:
+        # Sin log no se opera: salida controlada (código 1), no una traza.
+        print(f"No se pudo configurar el logging ({args.log_file!r}): {exc}",
+              file=sys.stderr)
+        return 1
+    log = logging.getLogger(__name__)
 
     try:
         config = load_config(args.config)
         trader = build_live_trader(config, args.checkpoint,
-                                   broker_name=args.broker)
-        trader.run_forever(
+                                   broker_name=args.broker,
+                                   journal_path=args.journal or None,
+                                   risk_state_path=args.risk_state or None,
+                                   heartbeat_path=args.heartbeat or None)
+        reason = trader.run_forever(
             poll_seconds=args.poll_seconds,
             max_iterations=args.max_iterations or None)
-        return 0
+        code = EXIT_CODES.get(reason, 0)
+        log.info("Proceso terminado: motivo=%s código=%d", reason, code)
+        return code
     except TradingAgentError as exc:
-        logging.getLogger(__name__).error(
-            "El trader terminó con error controlado: %s", exc)
+        log.error("El trader terminó con error controlado: %s", exc)
         return 1
 
 

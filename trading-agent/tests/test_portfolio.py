@@ -70,6 +70,29 @@ class TestClosePosition:
         expected = cash_after_buy + sell_price * 10 * 0.999  # - comisión
         assert p.cash == pytest.approx(expected)
 
+    def test_realized_pnl_includes_entry_commission(self):
+        """El P&L realizado es el del viaje completo: ambas comisiones."""
+        p = make_portfolio(commission=0.01)       # 1% por pata
+        p.open_position("AAPL", price=100.0, quantity=10)   # fee entrada 10
+        trade = p.close_position("AAPL", price=100.0)       # fee salida 10
+        assert trade.pnl == pytest.approx(-20.0)
+        # Y coincide exactamente con la variación de efectivo.
+        assert p.cash - 10_000.0 == pytest.approx(trade.pnl)
+
+    def test_partial_close_prorates_entry_commission(self):
+        p = make_portfolio(commission=0.01)
+        p.open_position("AAPL", price=100.0, quantity=10)
+        t1 = p.reduce_position("AAPL", price=100.0, quantity=5)
+        t2 = p.reduce_position("AAPL", price=100.0, quantity=5)
+        assert t1.pnl + t2.pnl == pytest.approx(-20.0)
+
+    def test_enforce_funds_false_mirrors_real_fill(self):
+        """Un broker real refleja el fill aunque el efectivo local no cuadre."""
+        p = make_portfolio(cash=100.0)
+        trade = p.open_position("AAPL", price=100.0, quantity=10,
+                                enforce_funds=False)
+        assert trade.quantity == 10 and p.cash == pytest.approx(-900.0)
+
     def test_close_without_position_raises(self):
         with pytest.raises(ExecutionError, match="No hay posición"):
             make_portfolio().close_position("AAPL", price=100.0)
@@ -80,6 +103,30 @@ class TestClosePosition:
         p.close_position("AAPL", price=90.0)
         assert [t.side for t in p.trades] == ["buy", "sell"]
         assert p.trades[1].pnl == pytest.approx(-50.0)
+
+
+class TestReducePosition:
+    def test_partial_sale_keeps_remainder(self):
+        p = make_portfolio()
+        p.open_position("AAPL", price=100.0, quantity=10)
+        trade = p.reduce_position("AAPL", price=110.0, quantity=4)
+        assert trade.quantity == 4
+        assert trade.pnl == pytest.approx(40.0)
+        assert p.positions["AAPL"].quantity == 6
+        assert p.cash == pytest.approx(9_000.0 + 440.0)
+
+    def test_full_quantity_closes(self):
+        p = make_portfolio()
+        p.open_position("AAPL", price=100.0, quantity=10)
+        p.reduce_position("AAPL", price=100.0, quantity=10)
+        assert not p.has_position("AAPL")
+
+    @pytest.mark.parametrize("qty", [0, -1, 11])
+    def test_invalid_quantity_raises(self, qty):
+        p = make_portfolio()
+        p.open_position("AAPL", price=100.0, quantity=10)
+        with pytest.raises(ExecutionError, match="inválida"):
+            p.reduce_position("AAPL", price=100.0, quantity=qty)
 
 
 class TestEquity:

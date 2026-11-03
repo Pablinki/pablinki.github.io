@@ -44,6 +44,8 @@ class Trade:
         price: precio de ejecución efectivo (ya incluye slippage).
         commission: comisión pagada en USD.
         pnl: ganancia/pérdida realizada en USD (solo en ventas; 0 en compras).
+        order_id: id de la orden en el broker (``None`` en simulación).
+        client_order_id: id de cliente idempotente enviado al broker.
     """
 
     symbol: str
@@ -52,6 +54,8 @@ class Trade:
     price: float
     commission: float
     pnl: float = 0.0
+    order_id: str | None = None
+    client_order_id: str | None = None
 
 
 @dataclass

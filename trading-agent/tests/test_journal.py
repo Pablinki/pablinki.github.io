@@ -31,6 +31,20 @@ class TestTradeJournal:
         assert rows[1]["reason"] == "stop_loss"
         assert float(rows[1]["pnl"]) == 99.8
 
+    def test_reconciliation_columns(self, tmp_path):
+        path = tmp_path / "trades.csv"
+        TradeJournal(path).record(
+            Trade("AAPL", "buy", 10, 100.0, 0.0, order_id="o-1",
+                  client_order_id="ta-AAPL-buy-x"),
+            reason="agent", equity=1.0, timestamp="t1",
+            bar_ts="2026-01-02T15:00:00+00:00", broker="AlpacaBroker")
+        with path.open(newline="") as fh:
+            row = next(iter(csv.DictReader(fh)))
+        assert row["bar_ts"] == "2026-01-02T15:00:00+00:00"
+        assert row["broker"] == "AlpacaBroker"
+        assert row["order_id"] == "o-1"
+        assert row["client_order_id"] == "ta-AAPL-buy-x"
+
     def test_default_timestamp_is_iso_utc(self, tmp_path):
         path = tmp_path / "trades.csv"
         TradeJournal(path).record(Trade("AAPL", "buy", 1, 1.0, 0.0),

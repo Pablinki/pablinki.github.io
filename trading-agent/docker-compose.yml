@@ -1,0 +1,34 @@
+# Despliegue del trading agent con Docker Compose.
+#
+#   cp .env.example .env   # y rellena las claves (NUNCA se suben al repo)
+#   docker compose up -d --build
+#   docker compose logs -f trader
+#   docker compose stop     # SIGTERM -> parada limpia con liquidación
+#
+# Política de reinicio: `on-failure` reinicia tras un cortacircuitos
+# (código 3) y tras un kill-switch (código 2); en este último caso el
+# trader se NIEGA a arrancar mientras logs/risk_state.json diga halted=true,
+# así que el bucle de reinicios se agota solo (max 5) y queda a la vista.
+
+services:
+  trader:
+    build: .
+    image: trading-agent:latest
+    restart: on-failure:5
+    stop_grace_period: 120s      # tiempo para liquidar antes de SIGKILL
+    env_file:
+      - .env                     # ALPACA_API_KEY, ALPACA_SECRET_KEY, ...
+    volumes:
+      - ./checkpoints:/app/checkpoints:ro
+      - ./logs:/app/logs         # diario, estado de riesgo, heartbeat, log
+      - ./.cache:/app/.cache     # caché de datos de mercado
+      - ./config.yaml:/app/config.yaml:ro
+    command: >
+      python scripts/run_live.py --config config.yaml
+      --checkpoint checkpoints/dqn_best.pt --poll-seconds 60
+      --broker paper
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

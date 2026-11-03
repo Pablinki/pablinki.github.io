@@ -19,7 +19,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==8.3.4"]
+dev = ["pytest==8.3.4", "ruff==0.17.3", "mypy==1.15.0", "pandas-stubs",
+       "types-PyYAML", "types-requests"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true
 
 [tool.setuptools.packages.find]
 where = ["src"]

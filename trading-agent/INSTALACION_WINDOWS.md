@@ -53,12 +53,7 @@ de usuario):
 ```powershell
 cd $HOME
 git clone https://github.com/Pablinki/pablinki.github.io.git
-cd pablinki.github.io
-
-# Mientras el PR no esté fusionado a main, cambia a la rama del agente:
-git checkout claude/trading-agent-dqn-sc1u4p
-
-cd trading-agent
+cd pablinki.github.io\trading-agent
 ```
 
 ## 3. Crear y activar el entorno virtual
@@ -172,9 +167,18 @@ python scripts\run_live.py --config config.yaml `
 El agente consulta el precio cada 60 s, decide (HOLD/BUY/SELL) **una vez
 por vela nueva** y lo simula sobre un portafolio virtual con comisiones y
 slippage. Se detiene limpiamente con **Ctrl+C** (liquida la posición
-abierta antes de salir). Cada operación queda registrada en el diario
-`logs\trades.csv` (ábrelo con Excel para revisar el historial; cambia la
-ruta con `--journal`).
+abierta antes de salir). Todo lo operativo queda en la carpeta `logs\`:
+
+| Archivo | Contenido |
+|---|---|
+| `trades.csv` | Diario de operaciones (ábrelo con Excel); cada compra, venta, stop y liquidación con precio, P&L, motivo e ids de orden |
+| `trader.log` | Log completo con rotación diaria (14 días) |
+| `risk_state.json` | Estado del gestor de riesgo; si el kill-switch saltó, el trader **no arranca** hasta que borres/edites este archivo |
+| `heartbeat.json` | Latido por iteración (equity, errores, última vela) para supervisión |
+
+Códigos de salida del proceso: `0` parada deliberada, `1` error al arrancar,
+`2` kill-switch de drawdown (no reiniciar sin revisar), `3` cortacircuitos
+por errores repetidos.
 
 > **Seguridad:** este modo es 100% simulado. El trading con dinero real
 > está deshabilitado por diseño salvo que definas explícitamente la

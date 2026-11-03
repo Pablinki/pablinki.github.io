@@ -27,6 +27,7 @@ Ejemplo (paper trading)::
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import json
 import logging
 import signal
@@ -69,7 +70,8 @@ class LiveTrader:
                  broker: BrokerAdapter | None = None,
                  journal: TradeJournal | None = None,
                  max_consecutive_errors: int = 10,
-                 risk_state_path: str | Path | None = None) -> None:
+                 risk_state_path: str | Path | None = None,
+                 heartbeat_path: str | Path | None = None) -> None:
         """
         Args:
             config: configuración de la aplicación.
@@ -90,6 +92,10 @@ class LiveTrader:
                 Un reinicio del proceso NO rearma el kill-switch: si está
                 activo en el archivo, el trader se niega a arrancar hasta
                 que un humano lo edite o borre. ``None`` = solo memoria.
+            heartbeat_path: archivo JSON que se reescribe al final de cada
+                iteración (iteración, hora, equity, errores seguidos...).
+                Un supervisor o ``HEALTHCHECK`` de Docker lo lee para
+                detectar un proceso "vivo" que ya no opera.
 
         Raises:
             TradingAgentError: parámetros inválidos, o kill-switch activo
@@ -103,7 +109,8 @@ class LiveTrader:
         self.symbol = config.data.symbols[0]
         self.risk = RiskManager(config.risk)
         self.risk_state_path = Path(risk_state_path) if risk_state_path else None
-        self._load_risk_state()
+        self.heartbeat_path = Path(heartbeat_path) if heartbeat_path else None
+        self.stop_reason: str | None = None  # por qué terminó run_forever
         if broker is None:
             broker = PaperBroker(Portfolio(
                 cash=config.env.initial_cash,
@@ -120,13 +127,43 @@ class LiveTrader:
         self._last_bar_date = None      # arma el límite de pérdida diaria
         self._last_decided_bar = None   # el agente decide UNA vez por vela
         self._last_price: float | None = None  # para liquidar sin red
+        self._load_risk_state()  # tras conocer el broker (ver método)
 
-    def _record(self, trade: Trade, *, reason: str, price: float) -> None:
+    def _record(self, trade: Trade, *, reason: str, price: float,
+                bar_ts: str | None = None) -> None:
         """Escribe una operación en el diario (si está activo)."""
         if self.journal is not None:
             self.journal.record(
                 trade, reason=reason,
-                equity=self.portfolio.equity({self.symbol: price}))
+                equity=self.portfolio.equity({self.symbol: price}),
+                bar_ts=bar_ts, broker=type(self.broker).__name__)
+
+    def _write_heartbeat(self, iteration: int, info: dict[str, object] | None,
+                         consecutive_errors: int) -> None:
+        """Reescribe el heartbeat JSON (escritura atómica, nunca lanza)."""
+        if self.heartbeat_path is None:
+            return
+        payload = {
+            "utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "iteration": iteration,
+            "symbol": self.symbol,
+            "broker": type(self.broker).__name__,
+            "consecutive_errors": consecutive_errors,
+            "halted": self.risk.halted,
+            "last_bar": (self._last_decided_bar.isoformat()
+                         if self._last_decided_bar is not None else None),
+            "equity": info.get("equity") if info else None,
+            "has_position": info.get("has_position") if info else None,
+            "market_closed": info.get("market_closed") if info else None,
+        }
+        try:
+            self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.heartbeat_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(self.heartbeat_path)
+        except OSError as exc:
+            logger.error("No se pudo escribir el heartbeat %s: %s",
+                         self.heartbeat_path, exc)
 
     # ------------------------------------------------------------------ #
     # Estado de riesgo persistente                                       #
@@ -148,8 +185,16 @@ class LiveTrader:
                 f"Estado de riesgo ilegible en {self.risk_state_path}: {exc}"
             ) from exc
         self.risk.load_dict(state)
+        if type(self.broker).sync is BrokerAdapter.sync:
+            # Simulación: el portafolio paper vuelve a initial_cash en cada
+            # arranque, así que el pico/baseline de la sesión anterior no
+            # son comparables (dispararían el kill-switch en el primer
+            # sondeo tras una racha ganadora). Se conservan solo el
+            # kill-switch y el enfriamiento.
+            self.risk.peak_equity = None
+            self.risk.day_start_equity = None
         logger.info("Estado de riesgo restaurado desde %s: %s",
-                    self.risk_state_path, state)
+                    self.risk_state_path, self.risk.to_dict())
         if self.risk.halted:
             raise TradingAgentError(
                 "Kill-switch de drawdown ACTIVO en el estado persistido "
@@ -176,13 +221,12 @@ class LiveTrader:
         por jornada: la contabilidad local debe coincidir con la cuenta;
         si no (orden manual, fill no visto...), manda la versión del broker.
         """
-        sync = getattr(self.broker, "sync", None)
-        if not callable(sync):
-            return
+        if type(self.broker).sync is BrokerAdapter.sync:
+            return  # simulación: no hay cuenta externa
         before_cash = self.portfolio.cash
         before_pos = {s: p.quantity for s, p in self.portfolio.positions.items()}
         try:
-            sync()
+            self.broker.sync(symbols=(self.symbol,))
         except ExecutionError as exc:
             logger.error("Reconciliación con el broker fallida: %s", exc)
             return
@@ -301,7 +345,7 @@ class LiveTrader:
                                                    tag=f"{tag}-{reason}")
                 forced_close = reason
                 self.risk.on_forced_close()
-                self._record(trade, reason=reason, price=price)
+                self._record(trade, reason=reason, price=price, bar_ts=tag)
                 logger.warning("%s: cierre forzoso por %s, P&L %.2f USD",
                                self.symbol, reason, trade.pnl)
             elif reason is not None:
@@ -330,7 +374,7 @@ class LiveTrader:
                 if qty > 0:
                     trade = self.broker.open_position(self.symbol, qty, price,
                                                       tag=tag)
-                    self._record(trade, reason="agent", price=price)
+                    self._record(trade, reason="agent", price=price, bar_ts=tag)
                     logger.info("%s: COMPRA %g @ %.2f", self.symbol, qty, price)
                 else:
                     logger.warning(
@@ -343,7 +387,7 @@ class LiveTrader:
                                self.symbol)
         elif action == Action.SELL and self.portfolio.has_position(self.symbol):
             trade = self.broker.close_position(self.symbol, price, tag=tag)
-            self._record(trade, reason="agent", price=price)
+            self._record(trade, reason="agent", price=price, bar_ts=tag)
             logger.info("%s: VENTA %g @ %.2f, P&L %.2f USD",
                         self.symbol, trade.quantity, price, trade.pnl)
 
@@ -360,7 +404,7 @@ class LiveTrader:
         }
 
     def run_forever(self, poll_seconds: float = 60.0,
-                    max_iterations: int | None = None) -> None:
+                    max_iterations: int | None = None) -> str:
         """Bucle principal de trading: decide cada ``poll_seconds``.
 
         El bucle es resiliente: los fallos de datos se registran y se
@@ -372,6 +416,13 @@ class LiveTrader:
                 sentido consultar más rápido que la granularidad de velas).
             max_iterations: tope de iteraciones (``None`` = infinito;
                 útil en tests y sesiones acotadas).
+
+        Returns:
+            Motivo de parada (también en ``self.stop_reason``):
+            ``"max_iterations"``, ``"signal"``, ``"kill_switch"`` o
+            ``"circuit_breaker"``. El CLI lo traduce a códigos de salida
+            distintos para que la política de reinicio del supervisor pueda
+            distinguir una parada deliberada de un fallo.
         """
         if poll_seconds < 1:
             raise TradingAgentError("poll_seconds debe ser >= 1")
@@ -383,11 +434,14 @@ class LiveTrader:
 
         iteration = 0
         consecutive_errors = 0
+        reason = "signal"
         try:
             while not self._stop_event.is_set():
                 if max_iterations is not None and iteration >= max_iterations:
+                    reason = "max_iterations"
                     break
                 iteration += 1
+                info: dict[str, object] | None = None
                 try:
                     info = self.run_once()
                     consecutive_errors = 0
@@ -398,6 +452,7 @@ class LiveTrader:
                                 " | misma vela" if info["stale_bar"] else "")
                     if self.risk.halted:
                         logger.critical("Kill-switch de drawdown activo: fin del bucle")
+                        reason = "kill_switch"
                         break
                 except DataProviderError as exc:
                     # Transitorio: registrar y esperar al siguiente ciclo.
@@ -413,14 +468,21 @@ class LiveTrader:
                     if consecutive_errors >= self.max_consecutive_errors:
                         logger.critical("Cortacircuitos: %d errores seguidos. "
                                         "Fin del bucle.", consecutive_errors)
+                        reason = "circuit_breaker"
                         break
+                finally:
+                    self._write_heartbeat(iteration, info, consecutive_errors)
                 # Espera interrumpible: una señal despierta el bucle al instante.
                 self._stop_event.wait(poll_seconds)
         finally:
             # Pase lo que pase (señal, kill-switch, excepción no prevista),
             # nunca se deja una posición abierta sin intentar liquidarla.
             self._liquidate()
-            logger.info("Bucle en vivo terminado tras %d iteraciones", iteration)
+            self.stop_reason = reason
+            self._write_heartbeat(iteration, None, consecutive_errors)
+            logger.info("Bucle en vivo terminado tras %d iteraciones (%s)",
+                        iteration, reason)
+        return reason
 
     def _liquidate(self) -> None:
         """Cierra la posición abierta (si existe) al detener el bucle."""
@@ -441,7 +503,9 @@ class LiveTrader:
                              "REVISAR MANUALMENTE.", self.symbol)
                 return
             trade = self.broker.close_position(self.symbol, price)
-            self._record(trade, reason="shutdown", price=price)
+            self._record(trade, reason="shutdown", price=price,
+                         bar_ts=(self._last_decided_bar.isoformat()
+                                 if self._last_decided_bar is not None else None))
             logger.info("Liquidación final: %s P&L %.2f USD", self.symbol, trade.pnl)
         except Exception as exc:  # noqa: BLE001 - último recurso: avisar, no ocultar
             logger.error("No se pudo liquidar %s automáticamente: %s. "
@@ -451,7 +515,8 @@ class LiveTrader:
 def build_live_trader(config: AppConfig, checkpoint_path: str,
                       broker_name: str = "paper",
                       journal_path: str | None = None,
-                      risk_state_path: str | None = None) -> LiveTrader:
+                      risk_state_path: str | None = None,
+                      heartbeat_path: str | None = None) -> LiveTrader:
     """Construye un :class:`LiveTrader` con el checkpoint indicado.
 
     Args:
@@ -465,6 +530,7 @@ def build_live_trader(config: AppConfig, checkpoint_path: str,
             desactiva.
         risk_state_path: archivo JSON del estado de riesgo persistente
             (ver :class:`LiveTrader`); ``None`` = solo memoria.
+        heartbeat_path: archivo JSON de heartbeat (ver :class:`LiveTrader`).
 
     Returns:
         ``LiveTrader`` listo para :meth:`LiveTrader.run_forever`.
@@ -489,9 +555,9 @@ def build_live_trader(config: AppConfig, checkpoint_path: str,
         broker = make_broker(broker_name, Portfolio(
             cash=config.env.initial_cash, commission_pct=0.0,
             slippage_pct=0.0))
-        sync = getattr(broker, "sync", None)
-        if callable(sync):
-            sync()  # efectivo + posiciones reales (sobrevive a reinicios)
+        # Efectivo + posiciones reales de ESTE símbolo (sobrevive a reinicios).
+        broker.sync(symbols=(config.data.symbols[0],))
     journal = TradeJournal(journal_path) if journal_path else None
     return LiveTrader(config, agent, broker=broker, journal=journal,
-                      risk_state_path=risk_state_path)
+                      risk_state_path=risk_state_path,
+                      heartbeat_path=heartbeat_path)

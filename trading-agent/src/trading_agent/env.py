@@ -140,7 +140,7 @@ class TradingEnvironment:
         self._lows = aligned["low"].to_numpy()
         self._feat_matrix = self._features.to_numpy(dtype=np.float32)
         # Fechas de calendario por vela: arman el límite de pérdida diaria.
-        self._dates = self._features.index.date
+        self._dates = pd.DatetimeIndex(self._features.index).date
 
         n_steps = len(self._features) - env_config.window_size
         if n_steps < 2:

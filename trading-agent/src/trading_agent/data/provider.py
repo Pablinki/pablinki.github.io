@@ -74,18 +74,19 @@ def validate_ohlcv(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
         raise DataValidationError(f"{symbol}: el proveedor devolvió datos vacíos")
 
     df = df.copy()
-    df.columns = [str(c).lower() for c in df.columns]
+    df.columns = pd.Index([str(c).lower() for c in df.columns])
 
     missing = [c for c in OHLCV_COLUMNS if c not in df.columns]
     if missing:
         raise DataValidationError(f"{symbol}: faltan columnas {missing}")
 
-    if not isinstance(df.index, pd.DatetimeIndex):
+    index = df.index
+    if not isinstance(index, pd.DatetimeIndex):
         raise DataValidationError(f"{symbol}: el índice debe ser DatetimeIndex")
 
     df = df.loc[:, list(OHLCV_COLUMNS)].astype("float64")
-    df.index = df.index.tz_localize("UTC") if df.index.tz is None \
-        else df.index.tz_convert("UTC")
+    df.index = index.tz_localize("UTC") if index.tz is None \
+        else index.tz_convert("UTC")
     df = df[~df.index.duplicated(keep="last")].sort_index()
     df = df.dropna()
 

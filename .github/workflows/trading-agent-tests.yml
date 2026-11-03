@@ -34,10 +34,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
-          pip install ruff==0.17.3
+          pip install ruff==0.17.3 mypy==1.15.0 pandas-stubs types-PyYAML types-requests
 
       - name: Lint (ruff)
         run: ruff check src scripts tests
+
+      - name: Type check (mypy)
+        run: mypy src/trading_agent scripts
 
       - name: Run test suite
         run: pytest -q

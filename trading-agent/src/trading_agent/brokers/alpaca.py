@@ -28,6 +28,7 @@ El cliente HTTP es inyectable (cualquier objeto con la interfaz de
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from typing import Any
@@ -114,6 +115,8 @@ class AlpacaBroker(BrokerAdapter):
         })
         self.order_timeout_s = order_timeout_s
         self.poll_interval_s = poll_interval_s
+        self._last_order_id: str | None = None
+        self._last_client_order_id: str | None = None
 
     # ------------------------------------------------------------------ #
     # HTTP                                                               #
@@ -181,36 +184,52 @@ class AlpacaBroker(BrokerAdapter):
         logger.info("Efectivo sincronizado con Alpaca: %.2f USD",
                     self.portfolio.cash)
 
-    def sync_positions(self) -> None:
+    def sync_positions(self, symbols: tuple[str, ...] | None = None) -> None:
         """Refleja en el espejo las posiciones largas abiertas en Alpaca.
 
         Imprescindible tras un reinicio del proceso: sin esto, una
         posición real abierta sería invisible para el RiskManager (sin
         stop-loss) y el agente podría comprar de nuevo encima.
 
+        Args:
+            symbols: si se indica, solo se reflejan estas posiciones; las
+                de otros símbolos (otro proceso, operaciones manuales) se
+                registran con aviso y se ignoran — meterlas en el espejo
+                rompería la valoración del equity de este proceso.
+
         Raises:
-            ExecutionError: si la API falla o hay una posición corta
-                (este sistema solo opera en largo).
+            ExecutionError: si la API falla o hay una posición corta en
+                un símbolo operado (este sistema solo opera en largo).
         """
         raw = self._request("GET", "/v2/positions")
         if not isinstance(raw, list):
             raise ExecutionError("Respuesta inesperada de /v2/positions")
         self.portfolio.positions.clear()
         for p in raw:
+            symbol = p.get("symbol", "?")
+            if symbols is not None and symbol not in symbols:
+                logger.warning("Posición ajena en la cuenta ignorada: %s %s "
+                               "(este proceso opera %s)", symbol, p.get("qty"),
+                               ", ".join(symbols))
+                continue
             qty = float(p["qty"])
             if p.get("side", "long") != "long" or qty <= 0:
                 raise ExecutionError(
-                    f"Posición no soportada en {p.get('symbol')}: "
+                    f"Posición no soportada en {symbol}: "
                     f"side={p.get('side')!r} qty={qty}")
-            self.portfolio.positions[p["symbol"]] = Position(
-                p["symbol"], qty, float(p["avg_entry_price"]))
+            self.portfolio.positions[symbol] = Position(
+                symbol, qty, float(p["avg_entry_price"]))
             logger.info("Posición sincronizada desde Alpaca: %s %g @ %.4f",
-                        p["symbol"], qty, float(p["avg_entry_price"]))
+                        symbol, qty, float(p["avg_entry_price"]))
 
-    def sync(self) -> None:
-        """Sincroniza efectivo y posiciones (llamar al arrancar)."""
+    def sync(self, symbols: tuple[str, ...] | None = None) -> None:
+        """Sincroniza efectivo y posiciones (llamar al arrancar y cada día).
+
+        Args:
+            symbols: ver :meth:`sync_positions`.
+        """
         self.sync_cash()
-        self.sync_positions()
+        self.sync_positions(symbols)
 
     def is_market_open(self) -> bool:
         """Consulta el reloj de mercado de Alpaca (``GET /v2/clock``).
@@ -345,7 +364,19 @@ class AlpacaBroker(BrokerAdapter):
         filled_qty = float(filled["filled_qty"])
         if filled_qty <= 0:
             raise ExecutionError(f"Orden {order['id']} sin acciones ejecutadas")
+        self._last_order_id = str(order["id"])
+        self._last_client_order_id = client_order_id
         return filled_qty, float(filled["filled_avg_price"])
+
+    def _tag_trade(self, trade: Trade) -> Trade:
+        """Devuelve el trade con los ids de orden del último fill y lo
+        sustituye en el historial del portafolio (Trade es inmutable)."""
+        tagged = dataclasses.replace(
+            trade, order_id=self._last_order_id,
+            client_order_id=self._last_client_order_id)
+        if self.portfolio.trades and self.portfolio.trades[-1] is trade:
+            self.portfolio.trades[-1] = tagged
+        return tagged
 
     @staticmethod
     def _client_order_id(symbol: str, side: str, tag: str | None) -> str | None:
@@ -377,8 +408,8 @@ class AlpacaBroker(BrokerAdapter):
         # Espejo contable al precio real de ejecución (costes incluidos). El
         # fill YA ocurrió: se refleja aunque el efectivo local no cuadre
         # (p. ej. fill por encima del margen) y se re-sincroniza después.
-        trade = self.portfolio.open_position(symbol, fill_price, filled_qty,
-                                             enforce_funds=False)
+        trade = self._tag_trade(self.portfolio.open_position(
+            symbol, fill_price, filled_qty, enforce_funds=False))
         if self.portfolio.cash < 0:
             logger.warning("Efectivo espejo negativo tras el fill (%.2f): "
                            "re-sincronizando con la cuenta", self.portfolio.cash)
@@ -410,4 +441,5 @@ class AlpacaBroker(BrokerAdapter):
                          filled_qty, pos.quantity)
         logger.info("Alpaca SELL %s: %g @ %.4f (referencia %.4f)",
                     symbol, filled_qty, fill_price, price_hint)
-        return self.portfolio.reduce_position(symbol, fill_price, filled_qty)
+        return self._tag_trade(
+            self.portfolio.reduce_position(symbol, fill_price, filled_qty))

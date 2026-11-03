@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import Any
 
 from .config import RiskConfig
 from .portfolio import Position
@@ -68,7 +69,7 @@ class RiskManager:
         self.halted = False
         self.cooldown_remaining = 0
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, Any]:
         """Estado serializable (para sobrevivir a reinicios del proceso).
 
         Returns:
@@ -82,7 +83,7 @@ class RiskManager:
             "cooldown_remaining": self.cooldown_remaining,
         }
 
-    def load_dict(self, state: dict[str, object]) -> None:
+    def load_dict(self, state: dict[str, Any]) -> None:
         """Restaura el estado guardado con :meth:`to_dict`.
 
         Un reinicio NO debe rearmar el kill-switch ni olvidar el pico de
@@ -94,11 +95,11 @@ class RiskManager:
                 conservan el valor actual).
         """
         if state.get("peak_equity") is not None:
-            self.peak_equity = float(state["peak_equity"])  # type: ignore[arg-type]
+            self.peak_equity = float(state["peak_equity"])
         if state.get("day_start_equity") is not None:
-            self.day_start_equity = float(state["day_start_equity"])  # type: ignore[arg-type]
+            self.day_start_equity = float(state["day_start_equity"])
         self.halted = bool(state.get("halted", self.halted))
-        self.cooldown_remaining = int(state.get("cooldown_remaining", 0))  # type: ignore[arg-type]
+        self.cooldown_remaining = int(state.get("cooldown_remaining") or 0)
 
     def new_bar(self) -> None:
         """Avanza una vela: consume el enfriamiento tras un cierre forzoso."""

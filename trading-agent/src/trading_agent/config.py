@@ -74,7 +74,10 @@ class DataConfig:
 
     Attributes:
         provider: nombre del proveedor: ``"yahoo"`` o ``"bloomberg"``.
-        symbols: lista de tickers a operar, p. ej. ``["AAPL", "MSFT"]``.
+        symbols: tickers; **cada proceso entrena/opera solo el primero**
+            (un símbolo por proceso: aislamiento de fallos y de estado de
+            riesgo). Para varios símbolos, lanza un proceso por símbolo con
+            su propia config y carpeta ``logs/``.
         interval: granularidad de las velas (``"1m"``, ``"5m"``, ``"1h"``,
             ``"1d"``...). Debe ser soportada por el proveedor.
         lookback_days: días de histórico a descargar para entrenamiento.

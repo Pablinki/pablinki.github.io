@@ -62,6 +62,18 @@ class BrokerAdapter(abc.ABC):
             ExecutionError / InsufficientFundsError / SecurityError.
         """
 
+    def sync(self, symbols: tuple[str, ...] | None = None) -> None:
+        """Alinea el portafolio espejo con la cuenta del broker.
+
+        El simulador no tiene cuenta externa: no hace nada. Un broker real
+        sobreescribe efectivo y posiciones con la verdad de la cuenta.
+
+        Args:
+            symbols: símbolos que opera este proceso; las posiciones de
+                otros símbolos se ignoran (con aviso) en brokers reales.
+        """
+        return
+
     def is_market_open(self) -> bool:
         """¿Acepta el mercado órdenes ahora mismo?
 

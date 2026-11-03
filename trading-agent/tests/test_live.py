@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import pandas as pd
 import pytest
@@ -293,9 +294,11 @@ class TestProductionGuards:
             def __init__(self, portfolio):
                 super().__init__(portfolio)
                 self.syncs = 0
+                self.symbols_seen = None
 
-            def sync(self):
+            def sync(self, symbols=None):
                 self.syncs += 1
+                self.symbols_seen = symbols
                 self.portfolio.cash = 42_000.0  # la "cuenta" dice otra cosa
 
         broker = SyncingBroker(Portfolio(cash=100_000.0))
@@ -307,8 +310,43 @@ class TestProductionGuards:
         with caplog.at_level("CRITICAL"):
             trader.run_once()
         assert broker.syncs == 1
+        assert broker.symbols_seen == ("TEST",)   # solo el símbolo propio
         assert "DIVERGENCIA" in caplog.text
         assert trader.portfolio.cash == pytest.approx(42_000.0)
+
+    def test_stop_reason_and_heartbeat(self, tmp_path):
+        from trading_agent.env import Action
+
+        hb = tmp_path / "heartbeat.json"
+        trader = make_forced_trader(Action.HOLD, heartbeat_path=hb)
+        reason = trader.run_forever(poll_seconds=1.0, max_iterations=2)
+        assert reason == "max_iterations" and trader.stop_reason == reason
+        data = json.loads(hb.read_text())
+        assert data["iteration"] == 2 and data["consecutive_errors"] == 0
+        assert data["halted"] is False and data["utc"].endswith("+00:00")
+
+    def test_circuit_breaker_stop_reason(self):
+        from trading_agent.env import Action
+
+        trader = make_forced_trader(
+            Action.HOLD, provider=ExplodingProvider(make_trader().config.data),
+            max_consecutive_errors=2)
+        assert trader.run_forever(poll_seconds=1.0, max_iterations=10) == "circuit_breaker"
+
+    def test_paper_restart_does_not_inherit_stale_peak(self, tmp_path):
+        """El portafolio paper arranca en initial_cash: un pico de equity
+        persistido de una sesión ganadora dispararía el kill-switch."""
+        from trading_agent.env import Action
+
+        path = tmp_path / "risk_state.json"
+        path.write_text(json.dumps({"peak_equity": 250_000.0,
+                                    "day_start_equity": 250_000.0,
+                                    "halted": False, "cooldown_remaining": 2}))
+        trader = make_forced_trader(Action.HOLD, risk_state_path=path)
+        assert trader.risk.peak_equity is None
+        assert trader.risk.cooldown_remaining == 2   # esto sí se conserva
+        trader.run_once()
+        assert not trader.risk.halted
 
     def test_invalid_max_consecutive_errors_raises(self):
         from trading_agent.env import Action

@@ -54,7 +54,7 @@ class BloombergProvider(DataProvider):
                 "Terminal Bloomberg. Instálalo o usa provider: 'yahoo'."
             ) from exc
         self._host = get_secret("BLOOMBERG_HOST")
-        self._port = int(get_secret("BLOOMBERG_PORT"))
+        self._port = int(str(get_secret("BLOOMBERG_PORT")))
 
     def _bbg_id(self, symbol: str) -> str:
         """Identificador Bloomberg completo (``"AAPL US Equity"``).

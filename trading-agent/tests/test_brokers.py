@@ -238,6 +238,34 @@ class TestAlpacaSync:
         assert pos.quantity == 10
         assert pos.entry_price == pytest.approx(123.45)
 
+    def test_sync_positions_ignores_foreign_symbols(self, monkeypatch, caplog):
+        """Posiciones de otros símbolos (otro proceso, manuales) no entran
+        en el espejo: romperían la valoración del equity de este proceso."""
+        session = FakeSession()
+        session.queue("GET", "/v2/positions", payload=[
+            {"symbol": "AAPL", "qty": "10", "side": "long",
+             "avg_entry_price": "100"},
+            {"symbol": "MSFT", "qty": "5", "side": "short",
+             "avg_entry_price": "300"},   # ni siquiera se valida: se ignora
+        ])
+        broker = make_alpaca(monkeypatch, session)
+        with caplog.at_level("WARNING"):
+            broker.sync_positions(symbols=("AAPL",))
+        assert set(broker.portfolio.positions) == {"AAPL"}
+        assert "ajena" in caplog.text
+
+    def test_trades_carry_broker_order_ids(self, monkeypatch):
+        session = FakeSession()
+        session.queue("POST", "/v2/orders", payload=order_json("new", order_id="o-77"))
+        session.queue("GET", "/v2/orders/o-77",
+                      payload=order_json("filled", order_id="o-77"))
+        broker = make_alpaca(monkeypatch, session)
+        trade = broker.open_position("AAPL", quantity=10, price_hint=100.0,
+                                     tag="2026-01-02T15:00:00")
+        assert trade.order_id == "o-77"
+        assert trade.client_order_id == "ta-AAPL-buy-2026-01-02T15-00-00"
+        assert broker.portfolio.trades[-1].order_id == "o-77"
+
     def test_sync_positions_rejects_shorts(self, monkeypatch):
         session = FakeSession()
         session.queue("GET", "/v2/positions", payload=[

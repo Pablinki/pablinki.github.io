@@ -70,8 +70,12 @@ modo *paper trading* con una capa de **gestión de riesgo determinista**.
 | `agent/dqn.py` | Agente Double DQN + red objetivo + persistencia |
 | `portfolio.py` | Posiciones, trades, equity |
 | `risk.py` | Stop-loss, take-profit, drawdown, pérdida diaria |
-| `train.py` | Bucle de entrenamiento y evaluación |
-| `live.py` | Bucle de trading en tiempo real (paper) |
+| `train.py` | Bucle de entrenamiento, split temporal 3 vías y evaluación en test |
+| `live.py` | Bucle de trading en tiempo real (paper o broker real) |
+| `brokers/` | `BrokerAdapter`, `PaperBroker` (simulado) y `AlpacaBroker` (real) |
+| `metrics.py` | Drawdown máximo, Sharpe, profit factor |
+| `journal.py` | Diario CSV de operaciones (auditoría) |
+| `logging_setup.py` | Consola + archivo con rotación diaria |
 
 ---
 
@@ -319,19 +323,34 @@ supervisión:
   y vuelve a intentarlo, Alpaca la rechaza como duplicada y el adaptador la
   recupera por id en lugar de comprar dos veces. Los fills parciales tras
   un timeout se reflejan en el espejo (nunca acciones reales sin contar).
-- **Docker**: `Dockerfile` listo para desplegar (imagen `python:3.11-slim`,
-  torch CPU, usuario sin privilegios, `SIGTERM` → parada limpia):
+- **Supervisión**: `logs/heartbeat.json` se reescribe en cada iteración;
+  `scripts/healthcheck.py` (y el `HEALTHCHECK` de Docker) lo leen y marcan
+  el proceso como no sano si envejece, si el kill-switch está activo o si
+  acumula errores — un proceso "vivo" que dejó de operar no pasa
+  desapercibido. Log con rotación diaria en `logs/trader.log`.
+- **Códigos de salida** distinguibles para la política de reinicio:
+  `0` parada deliberada, `1` error controlado al arrancar, `2` kill-switch
+  (no reiniciar a ciegas: el estado persistido impide rearrancar),
+  `3` cortacircuitos (reiniciar tiene sentido).
+- **Docker / Compose**: `Dockerfile` (imagen `python:3.11-slim`, torch CPU,
+  usuario sin privilegios, `HEALTHCHECK`, `SIGTERM` → parada limpia) y
+  `docker-compose.yml` con `restart: on-failure`, `stop_grace_period: 120s`
+  (tiempo para liquidar) y credenciales desde `.env` (plantilla en
+  `.env.example`):
 
   ```bash
-  docker build -t trading-agent .
-  docker run -d --restart unless-stopped --name trader \
-      -v $(pwd)/checkpoints:/app/checkpoints -v $(pwd)/logs:/app/logs \
-      -e ALPACA_API_KEY -e ALPACA_SECRET_KEY \
-      trading-agent python scripts/run_live.py --broker alpaca
+  cp .env.example .env            # rellena las claves; .env nunca se sube
+  docker compose up -d --build
+  docker compose logs -f trader
+  docker compose stop             # parada limpia con liquidación
   ```
 
-- **CI**: en cada push/PR, GitHub Actions ejecuta lint (`ruff`), la suite
-  completa y los doctests (los ejemplos de la documentación se verifican).
+- **Un símbolo por proceso**: cada proceso opera `symbols[0]` con su propia
+  config y carpeta `logs/`; las posiciones de otros símbolos en la misma
+  cuenta se ignoran (con aviso). Para N símbolos, N servicios.
+- **CI**: en cada push/PR, GitHub Actions ejecuta lint (`ruff`), tipado
+  (`mypy`), la suite completa y los doctests (los ejemplos de la
+  documentación se verifican).
 
 ## Escalabilidad
 
